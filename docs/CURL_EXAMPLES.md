@@ -6,8 +6,10 @@
 curl http://localhost:8000/
 ```
 
-## Implement Next Commit
+## Implement Ticket
 
 ```bash
-curl -X POST http://localhost:8000/implementNextCommit
+curl -X POST http://localhost:8000/implementTicket \
+  -H "Content-Type: application/json" \
+  -d '{"ticket": "Your ticket content here"}'
 ```

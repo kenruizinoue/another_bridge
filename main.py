@@ -1,21 +1,28 @@
 import os
 import subprocess
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 app = FastAPI()
 
 TARGET_DIRECTORY = os.path.expanduser("~/Desktop/another_logic_backend")
-TICKET_FILE = os.path.join(os.path.dirname(__file__), "ticket.txt")
 PROFILE_FILE = os.path.join(os.path.dirname(__file__), "profiles", "npm_install.txt")
 CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
+class TicketRequest(BaseModel):
+    ticket: str
+
 
 @app.get("/")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/implementNextCommit")
-def implement_next_commit():
+@app.post("/implementTicket")
+def implement_ticket(body: TicketRequest):
+    ticket = body.ticket
+
     ls_result = subprocess.run(["ls", TARGET_DIRECTORY], capture_output=True, text=True)
     if ls_result.returncode != 0:
         return {"error": f"Cannot open directory: {ls_result.stderr.strip()}"}
@@ -23,9 +30,6 @@ def implement_next_commit():
     files = ls_result.stdout.splitlines()
     if "CLAUDE.md" not in files:
         return {"error": "CLAUDE.md not found in target directory"}
-
-    with open(TICKET_FILE) as f:
-        ticket = f.read().strip()
 
     with open(PROFILE_FILE) as f:
         profile = f.read().strip()
