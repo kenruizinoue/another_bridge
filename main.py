@@ -5,7 +5,9 @@ from fastapi import FastAPI
 app = FastAPI()
 
 TARGET_DIRECTORY = os.path.expanduser("~/Desktop/another_logic_backend")
-
+TICKET_FILE = os.path.join(os.path.dirname(__file__), "ticket.txt")
+PROFILE_FILE = os.path.join(os.path.dirname(__file__), "profiles", "npm_install.txt")
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 @app.get("/")
 def health():
@@ -22,8 +24,14 @@ def implement_next_commit():
     if "CLAUDE.md" not in files:
         return {"error": "CLAUDE.md not found in target directory"}
 
+    with open(TICKET_FILE) as f:
+        ticket = f.read().strip()
+
+    with open(PROFILE_FILE) as f:
+        profile = f.read().strip()
+
     claude_result = subprocess.run(
-        ["claude", "-p", "explain about this project", "--dangerously-skip-permissions"],
+        ["claude", "-p", f"implement this ticket: {ticket}\n\nIMPORTANT: {profile}", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions"],
         capture_output=True,
         text=True,
         cwd=TARGET_DIRECTORY,
