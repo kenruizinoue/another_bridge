@@ -14,14 +14,22 @@ def health():
 
 @app.post("/implementNextCommit")
 def implement_next_commit():
-    result = subprocess.run(["ls", TARGET_DIRECTORY], capture_output=True, text=True)
-    if result.returncode != 0:
-        return {"error": f"Cannot open directory: {result.stderr.strip()}"}
+    ls_result = subprocess.run(["ls", TARGET_DIRECTORY], capture_output=True, text=True)
+    if ls_result.returncode != 0:
+        return {"error": f"Cannot open directory: {ls_result.stderr.strip()}"}
 
-    files = result.stdout.splitlines()
-    has_claude_md = "CLAUDE.md" in files
+    files = ls_result.stdout.splitlines()
+    if "CLAUDE.md" not in files:
+        return {"error": "CLAUDE.md not found in target directory"}
 
-    return {
-        "directory": TARGET_DIRECTORY,
-        "claude_md_found": has_claude_md,
-    }
+    claude_result = subprocess.run(
+        ["claude", "-p", "explain about this project", "--dangerously-skip-permissions"],
+        capture_output=True,
+        text=True,
+        cwd=TARGET_DIRECTORY,
+    )
+
+    if claude_result.returncode != 0:
+        return {"error": claude_result.stderr.strip()}
+
+    return {"claude_response": claude_result.stdout.strip()}
