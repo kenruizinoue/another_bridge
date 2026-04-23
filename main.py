@@ -3,7 +3,11 @@ import subprocess
 import requests
 import structlog
 import logging
+from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+load_dotenv()
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
@@ -31,9 +35,9 @@ def verify_api_key():
     return {"another_logic_api_key": ANOTHER_LOGIC_API_KEY}
 
 
-@app.get("/")
+@app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True, "service": "another_coder"}
 
 
 @app.post("/implementTicket")
@@ -69,17 +73,33 @@ def implement_ticket():
         profile = f.read().strip()
 
     log.info("implement_ticket.running_claude", model=CLAUDE_MODEL, cwd=TARGET_DIRECTORY)
-    claude_result = subprocess.run(
-        ["claude", "-p", f"implement this ticket: {ticket}\n\nIMPORTANT: {profile}", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions"],
-        capture_output=True,
-        text=True,
-        cwd=TARGET_DIRECTORY,
-    )
 
-    if claude_result.returncode != 0:
-        log.error("implement_ticket.claude_failed", returncode=claude_result.returncode, stderr=claude_result.stderr.strip())
-        return {"error": claude_result.stderr.strip()}
+    def stream_claude():
+        global PREVIOUS_RESULT
+        proc = subprocess.Popen(
+            ["claude", "-p", f"implement this ticket: {ticket}\n\nIMPORTANT: {profile}", "--model", CLAUDE_MODEL, "--dangerously-skip-permissions"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=TARGET_DIRECTORY,
+        )
 
-    PREVIOUS_RESULT = ticket
-    log.info("implement_ticket.done", new_previous_result=PREVIOUS_RESULT)
-    return {"claude_response": claude_result.stdout.strip()}
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line:
+                log.info("claude.output", line=line)
+                yield f"data: {line}\n\n"
+
+        proc.wait()
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().strip()
+            log.error("implement_ticket.claude_failed", returncode=proc.returncode, stderr=stderr)
+            yield f"data: ERROR: {stderr}\n\n"
+        else:
+            PREVIOUS_RESULT = ticket
+            log.info("implement_ticket.done", new_previous_result=PREVIOUS_RESULT)
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_claude(), media_type="text/event-stream")
