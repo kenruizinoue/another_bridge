@@ -1,12 +1,59 @@
 {
-  "name": "Planner Agent",
-  "description": "Reads GitHub issues via webhook tools and delegates implementation planning to Claude Code running in the target repo. Chains github_search_issues (if needed) → github_get_issue → instruct_planning, then returns a ticket summary and the verbatim plan.",
+  "name": "Engineering Manager Agent",
+  "description": "The Coder Team. Engineering Manager is the entry point; it coordinates a Planner Agent that reads GitHub tickets and delegates implementation planning to Claude Code in the target repo. Evaluator and Developer agents will live in this same bundle as Milestones 4–5 land.",
   "version": "1.0.0",
   "category": "other",
   "tags": [],
   "isPro": false,
   "resources": {
     "agents": [
+      {
+        "name": "Engineering Manager Agent",
+        "description": "Coordinator that routes ticket-related work to the Planner Agent (and later to Evaluator and Developer). Does not hit GitHub or the repo directly — delegates and passes results back verbatim.",
+        "llmConfig": {
+          "llmEngine": "gpt",
+          "model": "gpt-4o-mini",
+          "temperature": 0.2,
+          "maxTokens": 1024
+        },
+        "prompt": {
+          "preamble": "ROLE: You are \"{agentName}\", the Engineering Manager. You coordinate the engineering team by routing requests to the right specialist agent.\n- Today's date is {currentDate}.\n\nWHO YOU DELEGATE TO:\n- Planner Agent: reads GitHub tickets and produces concrete, repo-grounded implementation plans. Delegate anything about a ticket (plan it, summarize it, list tickets, read details) to the Planner.\n\nHOW TO ACT:\n1. If the user's request is about a GitHub ticket (plan, summarize, list, fetch details, triage), delegate to the Planner Agent immediately. Pass the user's request through verbatim.\n2. When the Planner returns, show the user the Planner's full response unchanged — do NOT rewrite, paraphrase, or add headers.\n3. If the user asks something clearly NOT about tickets (greeting, status check, general chit-chat), respond briefly yourself and do NOT delegate.\n\nCONSTRAINTS:\n- You have no direct tools. Do NOT attempt to plan, call GitHub, or spawn Claude Code yourself — the Planner handles all of that.\n- If delegation fails or returns an error, tell the user plainly and stop. Do not fabricate a plan.\n- Keep your own framing minimal. You are a router, not a summarizer. The Planner's response is already well-formatted.",
+          "sections": [
+            {
+              "key": "aiAgentFacts",
+              "template": "MEMORY AND STYLE OF {agentName}:\n{aiAgentFacts}"
+            },
+            {
+              "key": "history",
+              "template": "RECENT HISTORY:\n{history}"
+            }
+          ]
+        },
+        "memory": {
+          "retrieval": [],
+          "extraction": {
+            "enabled": false,
+            "threshold": 6
+          },
+          "chatHistoryCount": 6
+        },
+        "tools": {
+          "useTools": false,
+          "maxCalls": 0,
+          "allowRepeat": false,
+          "allowedTools": [],
+          "executionMode": "react"
+        },
+        "agents": {
+          "useAgents": true,
+          "maxCalls": 3,
+          "allowRepeat": false,
+          "allowedAgents": [
+            "Planner Agent"
+          ],
+          "maxDepth": 3
+        }
+      },
       {
         "name": "Planner Agent",
         "description": "Reads GitHub issues via webhook tools and delegates implementation planning to Claude Code running in the target repo. Chains github_search_issues (if needed) → github_get_issue → instruct_planning, then returns a ticket summary and the verbatim plan.",
