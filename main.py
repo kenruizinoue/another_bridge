@@ -1,10 +1,11 @@
 import os
 import subprocess
+from typing import Any
 import requests
 import structlog
 import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 load_dotenv()
@@ -20,6 +21,10 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 ANOTHER_LOGIC_API_KEY = os.environ.get("ANOTHER_LOGIC_API_KEY", "")
 ANOTHER_LOGIC_BASE_URL = os.environ.get("ANOTHER_LOGIC_BASE_URL", "http://localhost:3000")
 ASK_PROFILE_ID = "69bee9d1f38c71f60bd3ce10"
+
+GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
+GITHUB_DEFAULT_REPO = os.environ.get("GITHUB_DEFAULT_REPO", "")
+GITHUB_API_BASE = "https://api.github.com"
 
 PREVIOUS_RESULT = "Nothing"
 
@@ -38,6 +43,62 @@ def verify_api_key():
 @app.get("/health")
 def health():
     return {"ok": True, "service": "another_coder"}
+
+
+@app.post("/tools/github_search_issues")
+async def github_search_issues(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    args = body.get("arguments") if isinstance(body, dict) else None
+    if not isinstance(args, dict):
+        args = body if isinstance(body, dict) else {}
+
+    repo = args.get("repo") or GITHUB_DEFAULT_REPO
+    label = args.get("label")
+    state = args.get("state") or "open"
+
+    log.info("github_search_issues.request", repo=repo, label=label, state=state)
+
+    if not GITHUB_PAT:
+        log.error("github_search_issues.missing_pat")
+        return {"error": "GITHUB_PAT not configured in another_coder/.env"}
+    if not repo:
+        log.error("github_search_issues.missing_repo")
+        return {"error": "repo not provided and GITHUB_DEFAULT_REPO not configured"}
+
+    params: dict[str, Any] = {"state": state, "per_page": 30}
+    if isinstance(label, str) and label.strip():
+        params["labels"] = label.strip()
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    resp = requests.get(f"{GITHUB_API_BASE}/repos/{repo}/issues", headers=headers, params=params, timeout=15)
+    if not resp.ok:
+        log.error("github_search_issues.api_failed", status=resp.status_code, body=resp.text)
+        return {"error": f"GitHub API {resp.status_code}: {resp.text}"}
+
+    raw = resp.json()
+    issues = [
+        {
+            "number": item["number"],
+            "title": item["title"],
+            "labels": [lbl["name"] for lbl in item.get("labels", [])],
+            "url": item["html_url"],
+            "state": item["state"],
+        }
+        for item in raw
+        if "pull_request" not in item
+    ]
+
+    log.info("github_search_issues.ok", count=len(issues), repo=repo)
+    return {"issues": issues, "count": len(issues), "repo": repo}
 
 
 @app.post("/implementTicket")
