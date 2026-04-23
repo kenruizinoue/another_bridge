@@ -8,6 +8,7 @@ GITHUB_DEFAULT_REPO = os.environ.get("GITHUB_DEFAULT_REPO", "")
 GITHUB_API_BASE = "https://api.github.com"
 
 CODING_REPO_PATH = os.environ.get("CODING_REPO_PATH", "")
+BASE_BRANCH = os.environ.get("BASE_BRANCH", "dev")
 
 TARGET_DIRECTORY = os.path.expanduser("~/Desktop/another_logic_backend")
 PROFILE_FILE = os.path.join(os.path.dirname(__file__), "profiles", "npm_install.txt")
