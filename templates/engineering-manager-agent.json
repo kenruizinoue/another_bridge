@@ -39,7 +39,7 @@
         },
         "tools": {
           "useTools": false,
-          "maxCalls": 0,
+          "maxCalls": 1,
           "allowRepeat": false,
           "allowedTools": [],
           "executionMode": "react"
