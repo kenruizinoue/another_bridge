@@ -47,7 +47,7 @@ async def github_search_issues(request: Request) -> dict[str, Any]:
         log.error("github_search_issues.missing_repo")
         return {"error": "repo not provided and GITHUB_DEFAULT_REPO not configured"}
 
-    params: dict[str, Any] = {"state": state, "per_page": 30}
+    params: dict[str, Any] = {"state": state, "per_page": 100}
     if isinstance(label, str) and label.strip():
         params["labels"] = label.strip()
 
