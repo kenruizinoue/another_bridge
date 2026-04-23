@@ -1,3 +1,4 @@
+import os
 import subprocess
 import time
 from typing import Any
@@ -5,7 +6,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Request
 
-from config import CLAUDE_MODEL
+from config import CLAUDE_MODEL, CODING_REPO_PATH
 
 log = structlog.get_logger()
 
@@ -50,12 +51,31 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         log.error("instruct_planning.missing_ticket_body")
         return {"error": "ticket_body is required and must be a non-empty string"}
 
+    resolved_repo_path = repo_path or CODING_REPO_PATH
+    if not resolved_repo_path:
+        log.error("instruct_planning.missing_repo_path")
+        return {"error": "repo_path not provided and CODING_REPO_PATH not configured"}
+    if not os.path.isdir(resolved_repo_path):
+        log.error("instruct_planning.repo_path_not_found", repo_path=resolved_repo_path)
+        return {"error": f"repo_path does not exist or is not a directory: {resolved_repo_path}"}
+
     prompt = (
-        f"Read this ticket and produce a numbered implementation plan. "
-        f"Be concrete and concise.\n\nTicket #{ticket_number}:\n{ticket_body.strip()}"
+        f"You are planning work inside the repo located at {resolved_repo_path}. "
+        f"Read the ticket below and produce a numbered implementation plan.\n\n"
+        f"Requirements for the plan:\n"
+        f"- Reference concrete file paths (relative to the repo root) that you would touch.\n"
+        f"- Be concise: keep the whole plan under ~2000 tokens.\n"
+        f"- Prefer 5-10 numbered steps; each step is one sentence or a short paragraph.\n"
+        f"- Do NOT modify any files — this is a plan only.\n\n"
+        f"Ticket #{ticket_number}:\n{ticket_body.strip()}"
     )
 
-    log.info("instruct_planning.running_claude", ticket_number=ticket_number, model=CLAUDE_MODEL)
+    log.info(
+        "instruct_planning.running_claude",
+        ticket_number=ticket_number,
+        model=CLAUDE_MODEL,
+        repo_path=resolved_repo_path,
+    )
     started = time.time()
 
     try:
@@ -73,11 +93,17 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=PLANNING_TIMEOUT_SECONDS,
+            cwd=resolved_repo_path,
         )
     except subprocess.TimeoutExpired:
         duration = round(time.time() - started, 2)
-        log.error("instruct_planning.timeout", ticket_number=ticket_number, duration_seconds=duration)
-        return {"error": "timeout", "duration_seconds": duration}
+        log.error(
+            "instruct_planning.timeout",
+            ticket_number=ticket_number,
+            duration_seconds=duration,
+            repo_path=resolved_repo_path,
+        )
+        return {"error": "timeout", "duration_seconds": duration, "repo_path": resolved_repo_path}
 
     duration = round(time.time() - started, 2)
 
@@ -89,8 +115,14 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
             exit_code=result.returncode,
             stderr=stderr,
             duration_seconds=duration,
+            repo_path=resolved_repo_path,
         )
-        return {"error": stderr or "claude exited non-zero", "exit_code": result.returncode, "duration_seconds": duration}
+        return {
+            "error": stderr or "claude exited non-zero",
+            "exit_code": result.returncode,
+            "duration_seconds": duration,
+            "repo_path": resolved_repo_path,
+        }
 
     plan = (result.stdout or "").strip()
     log.info(
@@ -98,10 +130,12 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         ticket_number=ticket_number,
         plan_len=len(plan),
         duration_seconds=duration,
+        repo_path=resolved_repo_path,
     )
     return {
         "plan": plan,
         "ticket_number": ticket_number,
+        "repo_path": resolved_repo_path,
         "exit_code": 0,
         "duration_seconds": duration,
     }
