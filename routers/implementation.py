@@ -1,17 +1,19 @@
 import os
 import subprocess
+import time
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, Request
 
-from config import BASE_BRANCH, CODING_REPO_PATH
+from config import BASE_BRANCH, CLAUDE_MODEL, CODING_REPO_PATH
 
 log = structlog.get_logger()
 
 router = APIRouter()
 
 GIT_TIMEOUT_SECONDS = 60
+IMPLEMENTATION_TIMEOUT_SECONDS = 900
 
 
 def _extract_args(body: Any) -> dict[str, Any]:
@@ -155,10 +157,145 @@ async def instruct_implementation(request: Request) -> dict[str, Any]:
         repo_path=resolved_repo_path,
     )
 
+    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
+    implement_prompt = (
+        f"You are implementing Ticket #{ticket_number} in the repo at {resolved_repo_path}.\n"
+        f"You are currently on branch {branch_name}, branched from {base_branch}.\n\n"
+        f"TICKET:\n{ticket_body.strip()}\n\n"
+        f"PLAN (follow this exactly — another agent already approved it):\n{plan.strip()}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"- Implement the plan by editing files in this repo. You have full read/write permission here.\n"
+        f"- Sibling repos live under {workspace_dir} (e.g. ../<sibling>). You may READ them but must NOT modify anything outside this repo.\n"
+        f"- When done with all file changes, make ONE commit:\n"
+        f"    git add -A && git commit -m \"Implement ticket #{ticket_number}: <short summary>\"\n"
+        f"- Do NOT push the branch. Do NOT open a pull request. A later step handles that.\n"
+        f"- Do NOT run tests unless the plan explicitly says to.\n"
+        f"- If you hit a blocker you cannot resolve, commit whatever works and explain the blocker in your final output."
+    )
+
+    log.info(
+        "instruct_implementation.running_claude",
+        ticket_number=ticket_number,
+        model=CLAUDE_MODEL,
+        repo_path=resolved_repo_path,
+        branch_name=branch_name,
+    )
+    started = time.time()
+
+    try:
+        claude_result = subprocess.run(
+            [
+                "claude",
+                "-p",
+                implement_prompt,
+                "--model",
+                CLAUDE_MODEL,
+                "--output-format",
+                "text",
+                "--dangerously-skip-permissions",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=IMPLEMENTATION_TIMEOUT_SECONDS,
+            cwd=resolved_repo_path,
+        )
+    except subprocess.TimeoutExpired:
+        duration = round(time.time() - started, 2)
+        log.error(
+            "instruct_implementation.timeout",
+            ticket_number=ticket_number,
+            duration_seconds=duration,
+            branch_name=branch_name,
+        )
+        return {
+            "error": "timeout",
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "repo_path": resolved_repo_path,
+            "duration_seconds": duration,
+        }
+
+    duration = round(time.time() - started, 2)
+
+    if claude_result.returncode != 0:
+        stderr = (claude_result.stderr or "").strip()
+        log.error(
+            "instruct_implementation.claude_failed",
+            ticket_number=ticket_number,
+            exit_code=claude_result.returncode,
+            stderr=stderr,
+            duration_seconds=duration,
+        )
+        return {
+            "error": stderr or "claude exited non-zero",
+            "exit_code": claude_result.returncode,
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "repo_path": resolved_repo_path,
+            "duration_seconds": duration,
+        }
+
+    # Fallback: Claude might have left files staged but uncommitted. Auto-commit
+    # so the branch is always clean. If it already committed, this is a no-op.
+    status_after = _run_git(["status", "--porcelain"], resolved_repo_path)
+    if status_after.stdout.strip():
+        log.info("instruct_implementation.auto_commit_leftover", ticket_number=ticket_number)
+        _run_git(["add", "-A"], resolved_repo_path)
+        _run_git(
+            ["commit", "-m", f"Implement ticket #{ticket_number} (auto-commit fallback)"],
+            resolved_repo_path,
+        )
+
+    # Count commits made on this branch relative to base
+    commits_count_raw = _run_git(
+        ["rev-list", "--count", f"origin/{base_branch}..HEAD"],
+        resolved_repo_path,
+    )
+    try:
+        commits = int(commits_count_raw.stdout.strip() or "0")
+    except ValueError:
+        commits = 0
+
+    # Enumerate files changed vs base
+    files_diff = _run_git(
+        ["diff", "--name-only", f"origin/{base_branch}..HEAD"],
+        resolved_repo_path,
+    )
+    files_changed = [line for line in files_diff.stdout.splitlines() if line.strip()]
+
+    if commits == 0 and not files_changed:
+        log.error(
+            "instruct_implementation.empty_implementation",
+            ticket_number=ticket_number,
+            branch_name=branch_name,
+            claude_stdout_preview=(claude_result.stdout or "")[:500],
+        )
+        return {
+            "error": "claude produced no commits and no file changes — check claude_output for reasoning",
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "repo_path": resolved_repo_path,
+            "claude_output": (claude_result.stdout or "").strip(),
+            "duration_seconds": duration,
+        }
+
+    log.info(
+        "instruct_implementation.ok",
+        ticket_number=ticket_number,
+        branch_name=branch_name,
+        commits=commits,
+        files_changed_count=len(files_changed),
+        duration_seconds=duration,
+    )
+
     return {
         "ticket_number": ticket_number,
         "branch_name": branch_name,
         "base_branch": base_branch,
         "repo_path": resolved_repo_path,
+        "commits": commits,
+        "files_changed": files_changed,
+        "claude_output": (claude_result.stdout or "").strip(),
+        "duration_seconds": duration,
         "stub": True,
     }
