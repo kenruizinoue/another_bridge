@@ -1,0 +1,108 @@
+{
+  "name": "Planner Agent",
+  "description": "Reads GitHub issues via webhook tools. Finds candidates with github_search_issues, then fetches full details with github_get_issue. Returns a structured ticket summary. Does NOT plan implementation yet.",
+  "version": "1.0.0",
+  "category": "other",
+  "tags": [],
+  "isPro": false,
+  "resources": {
+    "agents": [
+      {
+        "name": "Planner Agent",
+        "description": "Reads GitHub issues via webhook tools. Finds candidates with github_search_issues, then fetches full details with github_get_issue. Returns a structured ticket summary. Does NOT plan implementation yet.",
+        "llmConfig": {
+          "llmEngine": "gpt",
+          "model": "gpt-4o-mini",
+          "temperature": 0.3,
+          "maxTokens": 2048
+        },
+        "prompt": {
+          "preamble": "ROLE: You are \"{agentName}\", the Planner. Your job is to find and read GitHub issues so they can be handed to the Developer downstream.\n- Today's date is {currentDate}.\n\nTOOLS YOU USE:\n- github_search_issues: list candidate issues. Optional filters: label, state. Use when the user does not name a specific issue number.\n- github_get_issue: fetch one issue's full body and comments. Required: issue_number. Use after picking a candidate, or directly when the user names a number.\n\nHOW TO ACT:\n1. If the user gives a specific issue number, skip search and call github_get_issue.\n2. If the user is vague (\"next ready ticket\", \"any bug\"), call github_search_issues with relevant filters first, pick the most appropriate one, then call github_get_issue.\n3. Always end by returning a structured summary in this exact format:\n\n   - **Ticket #N** — <title>\n   - **Labels:** <comma-separated labels>\n   - **URL:** <html_url>\n   - **Summary:** <2-4 sentence rephrase of the body>\n   - **Notable comments:** <bullet list, or \"none\">\n\nCONSTRAINTS:\n- Do NOT propose an implementation plan. That is a later step handled by another agent.\n- Do NOT modify the issue (no posting comments, no closing).\n- If a tool returns an error, report it plainly and stop.\n- Keep the summary objective; do not invent facts not in the issue.",
+          "sections": [
+            {
+              "key": "aiAgentFacts",
+              "template": "MEMORY AND STYLE OF {agentName}:\n{aiAgentFacts}"
+            },
+            {
+              "key": "history",
+              "template": "RECENT HISTORY:\n{history}"
+            }
+          ]
+        },
+        "memory": {
+          "retrieval": [],
+          "extraction": {
+            "enabled": false,
+            "threshold": 6
+          },
+          "chatHistoryCount": 6
+        },
+        "tools": {
+          "useTools": true,
+          "maxCalls": 5,
+          "allowRepeat": true,
+          "allowedTools": [
+            "github_search_issues",
+            "github_get_issue"
+          ],
+          "executionMode": "react"
+        }
+      }
+    ],
+    "tools": [
+      {
+        "name": "github_search_issues",
+        "description": "Search GitHub issues in the configured repo. Returns a list of issues with number, title, labels, url, state. Use this to find candidate tickets when the user does not name a specific issue number. Filter by label (e.g. 'bug', 'feature_request', 'ready') and/or state ('open', 'closed', 'all').",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "repo": {
+              "type": "string",
+              "description": "owner/repo string. Optional — defaults to GITHUB_DEFAULT_REPO configured in another_coder."
+            },
+            "label": {
+              "type": "string",
+              "description": "Filter by a single label name."
+            },
+            "state": {
+              "type": "string",
+              "enum": ["open", "closed", "all"],
+              "description": "Filter by issue state. Defaults to 'open'."
+            }
+          }
+        },
+        "target": "webhook",
+        "webhookUrl": "https://nonpursuant-locomotively-christopher.ngrok-free.dev/tools/github_search_issues",
+        "approvalRequired": false,
+        "skipRepeatApproval": false,
+        "approvalStyle": "raw",
+        "ownedBy": "Planner Agent"
+      },
+      {
+        "name": "github_get_issue",
+        "description": "Fetch a single GitHub issue with full body and all comments. Returns number, title, body, labels, comments (with author/body/created_at), and url. Use after github_search_issues picks a candidate, or directly when the user names a specific issue number.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "repo": {
+              "type": "string",
+              "description": "owner/repo string. Optional — defaults to GITHUB_DEFAULT_REPO configured in another_coder."
+            },
+            "issue_number": {
+              "type": "integer",
+              "description": "GitHub issue number to fetch."
+            }
+          },
+          "required": ["issue_number"]
+        },
+        "target": "webhook",
+        "webhookUrl": "https://nonpursuant-locomotively-christopher.ngrok-free.dev/tools/github_get_issue",
+        "approvalRequired": false,
+        "skipRepeatApproval": false,
+        "approvalStyle": "raw",
+        "ownedBy": "Planner Agent"
+      }
+    ],
+    "memories": []
+  }
+}
