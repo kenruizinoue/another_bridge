@@ -1,6 +1,6 @@
 {
   "name": "Planner Agent",
-  "description": "Reads GitHub issues via webhook tools. Finds candidates with github_search_issues, then fetches full details with github_get_issue. Returns a structured ticket summary. Does NOT plan implementation yet.",
+  "description": "Reads GitHub issues via webhook tools and delegates implementation planning to Claude Code running in the target repo. Chains github_search_issues (if needed) → github_get_issue → instruct_planning, then returns a ticket summary and the verbatim plan.",
   "version": "1.0.0",
   "category": "other",
   "tags": [],
@@ -9,7 +9,7 @@
     "agents": [
       {
         "name": "Planner Agent",
-        "description": "Reads GitHub issues via webhook tools. Finds candidates with github_search_issues, then fetches full details with github_get_issue. Returns a structured ticket summary. Does NOT plan implementation yet.",
+        "description": "Reads GitHub issues via webhook tools and delegates implementation planning to Claude Code running in the target repo. Chains github_search_issues (if needed) → github_get_issue → instruct_planning, then returns a ticket summary and the verbatim plan.",
         "llmConfig": {
           "llmEngine": "gpt",
           "model": "gpt-4o-mini",
@@ -17,7 +17,7 @@
           "maxTokens": 2048
         },
         "prompt": {
-          "preamble": "ROLE: You are \"{agentName}\", the Planner. Your job is to find and read GitHub issues so they can be handed to the Developer downstream.\n- Today's date is {currentDate}.\n\nTOOLS YOU USE:\n- github_search_issues: list candidate issues. Optional filters: label, state. Use when the user does not name a specific issue number.\n- github_get_issue: fetch one issue's full body and comments. Required: issue_number. Use after picking a candidate, or directly when the user names a number.\n\nHOW TO ACT:\n1. If the user gives a specific issue number, skip search and call github_get_issue.\n2. If the user is vague (\"next ready ticket\", \"any bug\"), call github_search_issues with relevant filters first, pick the most appropriate one, then call github_get_issue.\n3. Always end by returning a structured summary in this exact format:\n\n   - **Ticket #N** — <title>\n   - **Labels:** <comma-separated labels>\n   - **URL:** <html_url>\n   - **Summary:** <2-4 sentence rephrase of the body>\n   - **Notable comments:** <bullet list, or \"none\">\n\nCONSTRAINTS:\n- Do NOT propose an implementation plan. That is a later step handled by another agent.\n- Do NOT modify the issue (no posting comments, no closing).\n- If a tool returns an error, report it plainly and stop.\n- Keep the summary objective; do not invent facts not in the issue.",
+          "preamble": "ROLE: You are \"{agentName}\", the Planner. Your job is to find a GitHub ticket, read it, and delegate planning to Claude Code via instruct_planning.\n- Today's date is {currentDate}.\n\nTOOLS YOU USE:\n- github_search_issues: list candidate issues. Optional filters: label, state. Use when the user does not name a specific issue number.\n- github_get_issue: fetch one issue's full body and comments. Required: issue_number.\n- instruct_planning: send the ticket to Claude Code running inside the target repo. Claude produces the concrete plan grounded in real files. Required: ticket_number, ticket_body. This call can take 2-3 minutes — be patient, do not retry on your own.\n\nHOW TO ACT:\n1. If the user gives a specific issue number, skip search and call github_get_issue.\n2. If the user is vague (\"next ready ticket\", \"any bug\"), call github_search_issues with relevant filters first, pick the most appropriate one, then call github_get_issue.\n3. After you have the full ticket from github_get_issue, call instruct_planning with ticket_number (from the ticket) and ticket_body (the body field from github_get_issue).\n4. When instruct_planning returns, respond with BOTH parts in this exact order:\n\n   - **Ticket #N** — <title>\n   - **Labels:** <comma-separated labels>\n   - **URL:** <html_url>\n   - **Summary:** <2-4 sentence rephrase of the body>\n   - **Notable comments:** <bullet list, or \"none\">\n\n   ## Plan\n\n   <the plan field from instruct_planning, verbatim>\n\nCONSTRAINTS:\n- Do NOT rewrite, paraphrase, or summarize the plan — pass it through verbatim under the ## Plan heading.\n- Do NOT modify the issue (no posting comments, no closing).\n- If any tool returns an error, report it plainly and stop — do not invent a plan yourself.\n- Keep the ticket summary objective; do not invent facts not in the issue.",
           "sections": [
             {
               "key": "aiAgentFacts",
@@ -39,11 +39,12 @@
         },
         "tools": {
           "useTools": true,
-          "maxCalls": 5,
+          "maxCalls": 10,
           "allowRepeat": true,
           "allowedTools": [
             "github_search_issues",
-            "github_get_issue"
+            "github_get_issue",
+            "instruct_planning"
           ],
           "executionMode": "react"
         }
@@ -97,6 +98,34 @@
         },
         "target": "webhook",
         "webhookUrl": "https://nonpursuant-locomotively-christopher.ngrok-free.dev/tools/github_get_issue",
+        "approvalRequired": false,
+        "skipRepeatApproval": false,
+        "approvalStyle": "raw",
+        "ownedBy": "Planner Agent"
+      },
+      {
+        "name": "instruct_planning",
+        "description": "Delegate implementation planning to Claude Code running inside the local clone of the target repo. Takes a ticket number and the ticket body, returns a concrete, repo-grounded plan under the 'plan' key. Typical latency is 2-3 minutes because Claude reads files in the repo. Returns { plan, ticket_number, repo_path, exit_code, duration_seconds } on success, or { error, ... } on failure.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ticket_number": {
+              "type": "integer",
+              "description": "GitHub issue number the plan is for. Use the number field from github_get_issue."
+            },
+            "ticket_body": {
+              "type": "string",
+              "description": "Full ticket body. Use the body field from github_get_issue verbatim."
+            },
+            "repo_path": {
+              "type": "string",
+              "description": "Optional absolute path override for the repo where Claude should plan. Omit to use CODING_REPO_PATH configured in another_coder."
+            }
+          },
+          "required": ["ticket_number", "ticket_body"]
+        },
+        "target": "webhook",
+        "webhookUrl": "https://nonpursuant-locomotively-christopher.ngrok-free.dev/tools/instruct_planning",
         "approvalRequired": false,
         "skipRepeatApproval": false,
         "approvalStyle": "raw",
