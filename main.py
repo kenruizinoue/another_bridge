@@ -10,7 +10,7 @@ from config import (
     CLAUDE_MODEL,
     TARGET_DIRECTORY,
 )
-from routers import github, health, legacy, planning
+from routers import github, health, implementation, legacy, planning
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
@@ -33,4 +33,5 @@ def on_startup():
 app.include_router(health.router)
 app.include_router(github.router)
 app.include_router(planning.router)
+app.include_router(implementation.router)
 app.include_router(legacy.router)
