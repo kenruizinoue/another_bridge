@@ -59,8 +59,14 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         log.error("instruct_planning.repo_path_not_found", repo_path=resolved_repo_path)
         return {"error": f"repo_path does not exist or is not a directory: {resolved_repo_path}"}
 
+    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
+
     prompt = (
         f"You are planning work inside the repo located at {resolved_repo_path}. "
+        f"Sibling repos live under {workspace_dir} — e.g. \"../<sibling_repo_name>\" "
+        f"is reachable from here. You may READ files in sibling repos when the ticket "
+        f"references them (use file tools), but do NOT modify anything outside the "
+        f"target repo. Your edits (in a later step) will be scoped to the target repo only.\n\n"
         f"Read the ticket below and produce a numbered implementation plan.\n\n"
         f"Requirements for the plan:\n"
         f"- Reference concrete file paths (relative to the repo root) that you would touch.\n"
@@ -75,6 +81,7 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         ticket_number=ticket_number,
         model=CLAUDE_MODEL,
         repo_path=resolved_repo_path,
+        workspace_dir=workspace_dir,
     )
     started = time.time()
 
