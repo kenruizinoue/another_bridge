@@ -12,7 +12,7 @@ BASE_BRANCH = os.environ.get("BASE_BRANCH", "dev")
 
 TARGET_DIRECTORY = os.path.expanduser("~/Desktop/another_logic_backend")
 PROFILE_FILE = os.path.join(os.path.dirname(__file__), "profiles", "npm_install.txt")
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = "claude-opus-4-7"
 ANOTHER_LOGIC_API_KEY = os.environ.get("ANOTHER_LOGIC_API_KEY", "")
 ANOTHER_LOGIC_BASE_URL = os.environ.get("ANOTHER_LOGIC_BASE_URL", "http://localhost:3000")
 ASK_PROFILE_ID = "69bee9d1f38c71f60bd3ce10"
