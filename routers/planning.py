@@ -72,7 +72,11 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         f"- Reference concrete file paths (relative to the repo root) that you would touch.\n"
         f"- Be concise: keep the whole plan under ~2000 tokens.\n"
         f"- Prefer 5-10 numbered steps; each step is one sentence or a short paragraph.\n"
-        f"- Do NOT modify any files — this is a plan only.\n\n"
+        f"- Do NOT modify any files — this is a plan only.\n"
+        f"- Do NOT include steps that start dev servers (npm run dev, npm start, uvicorn,\n"
+        f"  yarn dev, etc.) or that depend on a running backend. The implementation runs\n"
+        f"  headless without local services. If verification is needed, the plan can\n"
+        f"  reference type-checks or unit tests, but never long-running processes.\n\n"
         f"Ticket #{ticket_number}:\n{ticket_body.strip()}"
     )
 
