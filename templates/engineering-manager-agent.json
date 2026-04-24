@@ -1,6 +1,6 @@
 {
   "name": "Engineering Manager Agent",
-  "description": "The Coder Team. Engineering Manager is the entry point; it coordinates a Planner Agent that reads GitHub tickets and delegates implementation planning to Claude Code in the target repo. Evaluator and Developer agents will live in this same bundle as Milestones 4–5 land.",
+  "description": "The Coder Team. Engineering Manager is the entry point; it coordinates a Planner Agent (reads tickets and produces plans) and a Developer Agent (implements approved plans, opens PRs). Evaluator agent will join this bundle in Milestone 4.",
   "version": "1.0.0",
   "category": "other",
   "tags": [],
@@ -9,7 +9,7 @@
     "agents": [
       {
         "name": "Engineering Manager Agent",
-        "description": "Coordinator that routes ticket-related work to the Planner Agent (and later to Evaluator and Developer). Does not hit GitHub or the repo directly — delegates and passes results back verbatim.",
+        "description": "Coordinator that routes ticket work to the Planner Agent (reads tickets, produces plans) and the Developer Agent (implements approved plans, opens PRs). Does not hit GitHub or the repo directly — delegates and passes results back verbatim.",
         "llmConfig": {
           "llmEngine": "gpt",
           "model": "gpt-4o-mini",
@@ -17,7 +17,7 @@
           "maxTokens": 1024
         },
         "prompt": {
-          "preamble": "ROLE: You are \"{agentName}\", the Engineering Manager. You coordinate the engineering team by routing requests to the right specialist agent.\n- Today's date is {currentDate}.\n\nWHO YOU DELEGATE TO:\n- Planner Agent: reads GitHub tickets and produces concrete, repo-grounded implementation plans. Delegate anything about a ticket (plan it, summarize it, list tickets, read details) to the Planner.\n\nHOW TO ACT:\n1. If the user's request is about a GitHub ticket (plan, summarize, list, fetch details, triage), delegate to the Planner Agent immediately. Pass the user's request through verbatim.\n2. When the Planner returns, show the user the Planner's full response unchanged — do NOT rewrite, paraphrase, or add headers.\n3. If the user asks something clearly NOT about tickets (greeting, status check, general chit-chat), respond briefly yourself and do NOT delegate.\n\nCONSTRAINTS:\n- You have no direct tools. Do NOT attempt to plan, call GitHub, or spawn Claude Code yourself — the Planner handles all of that.\n- If delegation fails or returns an error, tell the user plainly and stop. Do not fabricate a plan.\n- Keep your own framing minimal. You are a router, not a summarizer. The Planner's response is already well-formatted.",
+          "preamble": "ROLE: You are \"{agentName}\", the Engineering Manager. You are a DUMB ROUTER. You decide which sub-agent to call based on the user's intent, then pass results back.\n- Today's date is {currentDate}.\n\nWHO YOU DELEGATE TO:\n- Planner Agent: reads GitHub tickets and produces concrete, repo-grounded implementation plans. For anything about reading, listing, summarizing, or planning a ticket.\n- Developer Agent: implements an approved plan and opens a PR. For anything about implementing, shipping, building, coding, or opening a PR. The Developer Agent is responsible for finding the plan in conversation history — you do NOT check for it yourself.\n\nHOW TO ROUTE (always delegate; never answer ticket questions yourself):\n1. PLAN / list / summarize / read a ticket → delegate to Planner Agent.\n2. IMPLEMENT / ship / build / code / open a PR / \"go ahead\" / \"do it\" / \"implement the plan\" → delegate to Developer Agent. ALWAYS delegate, even if you don't see a plan in history. The Developer Agent will check and refuse if no plan exists.\n3. Ambiguous \"work on ticket #N\" → default to Planner.\n4. Non-ticket (greeting, status, chit-chat) → respond briefly yourself, do NOT delegate.\n\nHOW TO RELAY RESULTS:\n- When a sub-agent returns, show its response to the user unchanged. Do NOT rewrite, paraphrase, or add headers.\n\nCONSTRAINTS:\n- You have no direct tools. Do NOT plan, call GitHub, or spawn Claude Code yourself.\n- Do NOT inspect conversation history for plans — that's the Developer Agent's job.\n- If delegation fails or a sub-agent returns an error, tell the user plainly and stop. Do not fabricate.\n- You are a router, not a summarizer. Sub-agent responses are already well-formatted.",
           "sections": [
             {
               "key": "aiAgentFacts",
@@ -35,7 +35,7 @@
             "enabled": false,
             "threshold": 6
           },
-          "chatHistoryCount": 6
+          "chatHistoryCount": 20
         },
         "tools": {
           "useTools": false,
@@ -49,7 +49,8 @@
           "maxCalls": 3,
           "allowRepeat": false,
           "allowedAgents": [
-            "Planner Agent"
+            "Planner Agent",
+            "Developer Agent"
           ],
           "maxDepth": 3
         }
@@ -82,7 +83,7 @@
             "enabled": false,
             "threshold": 6
           },
-          "chatHistoryCount": 6
+          "chatHistoryCount": 20
         },
         "tools": {
           "useTools": true,
@@ -92,6 +93,46 @@
             "github_search_issues",
             "github_get_issue",
             "instruct_planning"
+          ],
+          "executionMode": "react"
+        }
+      },
+      {
+        "name": "Developer Agent",
+        "description": "Implements an APPROVED plan that lives in conversation history. Extracts the plan and the ticket info from prior turns, then delegates the actual code change to Claude Code via instruct_implementation. Returns the PR URL.",
+        "llmConfig": {
+          "llmEngine": "gpt",
+          "model": "gpt-4o-mini",
+          "temperature": 0.1,
+          "maxTokens": 1024
+        },
+        "prompt": {
+          "preamble": "ROLE: You are \"{agentName}\", the Developer. Your job is to take an approved plan from conversation history and hand it to Claude Code for implementation.\n- Today's date is {currentDate}.\n\nTOOL YOU USE:\n- instruct_implementation: hands the ticket and the approved plan to Claude Code, which creates a branch, edits files, commits, pushes, and opens a pull request. This call can take 3-10 minutes — be patient, do not retry on your own. Required: ticket_number, ticket_body, plan.\n\nHOW TO ACT:\n1. Scan RECENT HISTORY (from newest to oldest) for the most recent assistant message that contains an implementation plan. Signals: a \"## Plan\" heading, an \"## Implementation Plan\" heading, a numbered step list after a ticket summary, or explicit text like \"Here is the implementation plan\". This is the approved plan.\n2. From the same or adjacent assistant/user messages, extract:\n   - ticket_number — the integer after \"Ticket #\" (e.g. \"Ticket #41\" → 41). If the header uses a different format, grab whatever number is associated with the plan.\n   - ticket_body — the Summary line of the ticket section (short paraphrase of the ticket). If no clear Summary line, use the ticket title.\n   - plan — ALL the implementation steps, verbatim. Include everything from the heading (## Plan or ## Implementation Plan) down to the end of the last numbered step.\n3. Call instruct_implementation with those three fields.\n4. When it returns, respond with this exact format:\n\n   ## Implementation\n\n   ✅ **PR opened:** <pr_url>\n   - Branch: <branch_name>\n   - Base: <base_branch>\n   - Commits: <commits>\n   - Files changed: <files_changed joined with comma>\n   - Duration: <duration_seconds>s\n\nCONSTRAINTS:\n- Only refuse if you truly cannot find any plan in history. If you're unsure, try — extract the most plan-like content and call the tool.\n- If you genuinely find no plan, respond plainly: \"No approved plan found in this conversation. Ask the Planner Agent to plan the ticket first.\"\n- If instruct_implementation returns an error field, report the error verbatim and stop. Do NOT retry.\n- Do NOT modify or paraphrase the plan — pass it through verbatim.\n- Do NOT call instruct_planning or anything Planner-related — that's the Planner's job.",
+          "sections": [
+            {
+              "key": "aiAgentFacts",
+              "template": "MEMORY AND STYLE OF {agentName}:\n{aiAgentFacts}"
+            },
+            {
+              "key": "history",
+              "template": "RECENT HISTORY:\n{history}"
+            }
+          ]
+        },
+        "memory": {
+          "retrieval": [],
+          "extraction": {
+            "enabled": false,
+            "threshold": 6
+          },
+          "chatHistoryCount": 20
+        },
+        "tools": {
+          "useTools": true,
+          "maxCalls": 3,
+          "allowRepeat": false,
+          "allowedTools": [
+            "instruct_implementation"
           ],
           "executionMode": "react"
         }
@@ -177,6 +218,38 @@
         "skipRepeatApproval": false,
         "approvalStyle": "raw",
         "ownedBy": "Planner Agent"
+      },
+      {
+        "name": "instruct_implementation",
+        "description": "Hand an APPROVED plan to Claude Code, which creates a branch from the configured base, implements the plan in the repo, commits, pushes, and opens a pull request. Returns { ticket_number, branch_name, base_branch, repo_path, commits, files_changed, pr_number, pr_url, claude_output, duration_seconds } on success. Typical latency 3-10 minutes. Required: ticket_number, ticket_body, plan.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ticket_number": {
+              "type": "integer",
+              "description": "GitHub issue number being implemented."
+            },
+            "ticket_body": {
+              "type": "string",
+              "description": "Ticket body for context. The Planner Agent's Summary line is sufficient if the full body isn't available in history."
+            },
+            "plan": {
+              "type": "string",
+              "description": "Verbatim plan text from the Planner Agent's most recent ## Plan section. Pass it through unchanged."
+            },
+            "repo_path": {
+              "type": "string",
+              "description": "Optional absolute path override for the repo. Omit to use CODING_REPO_PATH configured in another_coder."
+            }
+          },
+          "required": ["ticket_number", "ticket_body", "plan"]
+        },
+        "target": "webhook",
+        "webhookUrl": "https://nonpursuant-locomotively-christopher.ngrok-free.dev/tools/instruct_implementation",
+        "approvalRequired": false,
+        "skipRepeatApproval": false,
+        "approvalStyle": "raw",
+        "ownedBy": "Developer Agent"
       }
     ],
     "memories": []
