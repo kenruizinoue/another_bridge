@@ -385,6 +385,16 @@ async def instruct_implementation(request: Request) -> dict[str, Any]:
     pr_url = pr_data.get("html_url")
     pr_number = pr_data.get("number")
 
+    # Switch back to base so the repo is ready for the next ticket. Don't fail
+    # the call if this hiccups — the PR is already shipped.
+    checkout_back = _run_git(["checkout", base_branch], resolved_repo_path)
+    if checkout_back.returncode != 0:
+        log.warning(
+            "instruct_implementation.cleanup_checkout_failed",
+            base_branch=base_branch,
+            stderr=checkout_back.stderr.strip(),
+        )
+
     total_duration = round(time.time() - started, 2)
     log.info(
         "instruct_implementation.ok",
