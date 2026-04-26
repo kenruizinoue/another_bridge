@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 from typing import Any
@@ -9,6 +10,34 @@ from fastapi import APIRouter, BackgroundTasks, Request
 from config import CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
 from routers.repos import _git_origin_url, _parse_owner_repo, validate_repo_path
+
+
+# Matches a trailing `SUMMARY: <text>` line in Claude's output. The plan
+# is everything before it; the summary feeds the platform's __summary__
+# opt-in (consumed by extractArtifactCandidates → artifact.summary, then
+# rendered in the next-turn [Conversation artifacts] block).
+_SUMMARY_LINE_RE = re.compile(r"\n\s*SUMMARY:\s*(.+?)\s*$", re.DOTALL)
+
+
+def split_plan_and_summary(claude_output: str) -> tuple[str, str | None]:
+    """Split Claude's planning output into (plan, summary).
+
+    Claude is instructed to end with `SUMMARY: <one sentence>`. When that
+    line is present, return (plan_without_it, summary). When absent
+    (Claude ignored the instruction or the output was truncated), return
+    (claude_output, None) — the platform's auto-summary fallback then
+    handles it. Pure function, no I/O — easy to unit-test.
+    """
+    match = _SUMMARY_LINE_RE.search(claude_output)
+    if not match:
+        return claude_output.strip(), None
+    summary = match.group(1).strip()
+    plan = claude_output[: match.start()].strip()
+    if not summary:
+        # Edge case: `SUMMARY:` line present but empty after the colon.
+        # Treat as missing so the platform falls back to auto-summary.
+        return plan, None
+    return plan, summary
 
 
 def _build_selected_repo_context(repo_path: str) -> dict[str, Any]:
@@ -78,6 +107,14 @@ def _run_planning_job(
         f"  yarn dev, etc.) or that depend on a running backend. The implementation runs\n"
         f"  headless without local services. If verification is needed, the plan can\n"
         f"  reference type-checks or unit tests, but never long-running processes.\n\n"
+        f"After the plan, on its own line at the very end, output exactly one line:\n"
+        f"  SUMMARY: <one sentence, max 200 characters, naming what this plan changes\n"
+        f"  and which areas/files it touches — written so the next agent can decide\n"
+        f"  at a glance whether to load the full plan>\n"
+        f"This SUMMARY line is the ONLY thing after the plan. No explanation, no\n"
+        f"trailing prose. Example:\n"
+        f"  SUMMARY: Ticket #34 plan — extracts session-token validation into shared\n"
+        f"  middleware (src/auth/) and adds 3 unit tests.\n\n"
         f"Ticket #{ticket_number}:\n{ticket_body.strip()}"
     )
 
@@ -134,32 +171,40 @@ def _run_planning_job(
         job_manager.mark_failed(job_id, stderr or f"claude exited with code {result.returncode}")
         return
 
-    plan = (result.stdout or "").strip()
+    raw_output = (result.stdout or "").strip()
+    plan, summary = split_plan_and_summary(raw_output)
     log.info(
         "instruct_planning.ok",
         job_id=job_id,
         ticket_number=ticket_number,
         plan_len=len(plan),
+        summary_present=summary is not None,
         duration_seconds=duration,
     )
-    job_manager.mark_done(
-        job_id,
-        {
-            "plan": plan,
-            "ticket_number": ticket_number,
-            "repo_path": resolved_repo_path,
-            "exit_code": 0,
-            "duration_seconds": duration,
-            # The platform strips __context__ from the LLM-visible response
-            # body and persists each key as a context artifact on the
-            # assistant message. Next turn's prompt injects them as
-            # [Conversation context] so the Developer Agent reads
-            # selected_repo.path directly instead of parsing markdown.
-            "__context__": {
-                "selected_repo": _build_selected_repo_context(resolved_repo_path),
-            },
+    payload: dict[str, Any] = {
+        "plan": plan,
+        "ticket_number": ticket_number,
+        "repo_path": resolved_repo_path,
+        "exit_code": 0,
+        "duration_seconds": duration,
+        # The platform strips __context__ from the LLM-visible response
+        # body and persists each key as a context artifact on the
+        # assistant message. Next turn's prompt injects them as
+        # [Conversation context] so the Developer Agent reads
+        # selected_repo.path directly instead of parsing markdown.
+        "__context__": {
+            "selected_repo": _build_selected_repo_context(resolved_repo_path),
         },
-    )
+    }
+    # The platform strips __summary__ from the LLM-visible response body
+    # and stashes it as the artifact's `summary` field. Shown in every
+    # subsequent turn's [Conversation artifacts] block, so the Developer
+    # Agent can decide at a glance whether to fetch_artifact for the
+    # full plan. Without this, the platform falls back to slicing the
+    # first 200 chars of the plan field — usable, but mechanical.
+    if summary:
+        payload["__summary__"] = summary
+    job_manager.mark_done(job_id, payload)
 
 
 @router.post("/tools/instruct_planning")
