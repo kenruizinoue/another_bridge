@@ -1,0 +1,186 @@
+"""Workspace repository discovery + path-validation guard.
+
+Exposes:
+- POST /tools/list_repos: webhook tool returning repos under WORKSPACE_ROOT
+  that have a .git/ directory AND a configured origin remote. Filters out
+  half-cloned forks, backups, and other non-repo directories.
+- validate_repo_path(): shared helper used by planning + implementation
+  routers to reject repo_path values outside the workspace root, including
+  symlink-escape and ../ traversal attempts.
+
+When WORKSPACE_ROOT is unset, validate_repo_path falls back to the legacy
+"is it a directory?" check so existing CODING_REPO_PATH deployments keep
+working unchanged.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+from typing import Any
+
+import structlog
+from fastapi import APIRouter, Request
+
+from config import WORKSPACE_ROOT
+
+log = structlog.get_logger()
+
+router = APIRouter()
+
+
+def _extract_args(body: Any) -> dict[str, Any]:
+    args = body.get("arguments") if isinstance(body, dict) else None
+    if not isinstance(args, dict):
+        args = body if isinstance(body, dict) else {}
+    return args
+
+
+# Matches owner/repo at the end of a GitHub HTTPS or SSH URL, with or
+# without a trailing .git. Examples it parses:
+#   https://github.com/kenruizinoue/another_agent_frontend.git
+#   git@github.com:kenruizinoue/another_agent_frontend.git
+#   https://github.com/kenruizinoue/another_agent_frontend
+_GITHUB_URL_RE = re.compile(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$")
+
+
+def _parse_owner_repo(origin_url: str) -> str | None:
+    m = _GITHUB_URL_RE.search(origin_url.strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def _git_origin_url(repo_dir: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
+def list_workspace_repos(workspace_root: str) -> list[dict[str, Any]]:
+    """Walk one level deep, return git repos with an origin remote."""
+    if not workspace_root or not os.path.isdir(workspace_root):
+        return []
+
+    repos: list[dict[str, Any]] = []
+    for entry in sorted(os.listdir(workspace_root)):
+        repo_dir = os.path.join(workspace_root, entry)
+        if not os.path.isdir(repo_dir):
+            continue
+        if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            continue
+        origin_url = _git_origin_url(repo_dir)
+        if not origin_url:
+            # Local-only repo without an origin — likely scratch/backup.
+            continue
+        repos.append(
+            {
+                "name": entry,
+                "path": repo_dir,
+                "origin_url": origin_url,
+                "owner_repo": _parse_owner_repo(origin_url),
+            }
+        )
+    return repos
+
+
+def validate_repo_path(
+    repo_path: str,
+    workspace_root: str = WORKSPACE_ROOT,
+) -> tuple[str | None, str | None]:
+    """Validate repo_path and return (resolved_path, error_message).
+
+    On success: (resolved_absolute_path, None).
+    On failure: (None, error_message_for_caller).
+
+    When workspace_root is unset, only checks isdir — preserves the
+    pre-allow-list behavior so CODING_REPO_PATH deployments aren't broken
+    by upgrading.
+    """
+    if not isinstance(repo_path, str) or not repo_path.strip():
+        return None, "repo_path must be a non-empty string"
+
+    candidate = os.path.realpath(os.path.expanduser(repo_path))
+    if not os.path.isdir(candidate):
+        return None, f"repo_path does not exist or is not a directory: {repo_path}"
+
+    if not workspace_root:
+        # No allow-list configured — legacy behavior.
+        return candidate, None
+
+    workspace_resolved = os.path.realpath(os.path.expanduser(workspace_root))
+
+    # commonpath raises ValueError on different drives or mixed abs/rel —
+    # treat that as "not contained."
+    try:
+        common = os.path.commonpath([workspace_resolved, candidate])
+    except ValueError:
+        return None, f"repo_path is outside the workspace root: {repo_path}"
+
+    if common != workspace_resolved or candidate == workspace_resolved:
+        return (
+            None,
+            f"repo_path must be a directory inside {workspace_root}, got: {repo_path}",
+        )
+
+    if not os.path.isdir(os.path.join(candidate, ".git")):
+        return None, f"repo_path is not a git repository (no .git/ found): {repo_path}"
+
+    return candidate, None
+
+
+@router.post("/tools/list_repos")
+async def list_repos(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    _ = _extract_args(body)  # no args today; reserved for future filters
+
+    log.info("list_repos.request", workspace_root=WORKSPACE_ROOT)
+
+    if not WORKSPACE_ROOT:
+        return {
+            "error": (
+                "WORKSPACE_ROOT not configured in another_coder/.env. "
+                "Set WORKSPACE_ROOT to the parent directory containing your "
+                "git repos so the agent can enumerate and target them."
+            )
+        }
+
+    if not os.path.isdir(WORKSPACE_ROOT):
+        return {
+            "error": (
+                f"WORKSPACE_ROOT is set but does not exist or is not a "
+                f"directory: {WORKSPACE_ROOT}"
+            )
+        }
+
+    repos = list_workspace_repos(WORKSPACE_ROOT)
+    log.info("list_repos.response", count=len(repos))
+    return {
+        "workspace_root": WORKSPACE_ROOT,
+        "count": len(repos),
+        "repos": repos,
+        # Cross-turn structured state — the platform strips __context__
+        # from the LLM-visible body and persists each key as a context
+        # artifact on the assistant message. The next turn's prompt then
+        # surfaces `available_repos` in its [Conversation context] block,
+        # so the Planner can read repo_path / owner_repo structurally
+        # instead of relying on the EM to relay markdown verbatim (which
+        # gpt-4o-mini routinely fails to do — it rewrites bullet lists
+        # as hyperlinks and drops the absolute path inside backticks).
+        "__context__": {
+            "available_repos": repos,
+        },
+    }

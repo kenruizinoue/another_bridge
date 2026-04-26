@@ -10,6 +10,12 @@ GITHUB_API_BASE = "https://api.github.com"
 CODING_REPO_PATH = os.environ.get("CODING_REPO_PATH", "")
 BASE_BRANCH = os.environ.get("BASE_BRANCH", "dev")
 
+# Optional. When set, planning + implementation only accept repo_path values
+# that resolve to a child of WORKSPACE_ROOT, and list_repos enumerates child
+# dirs containing both .git/ and an origin remote. Leave empty to preserve
+# the original CODING_REPO_PATH-only flow (no allow-list, no enumeration).
+WORKSPACE_ROOT = os.environ.get("WORKSPACE_ROOT", "")
+
 TARGET_DIRECTORY = os.path.expanduser("~/Desktop/another_logic_backend")
 PROFILE_FILE = os.path.join(os.path.dirname(__file__), "profiles", "npm_install.txt")
 CLAUDE_MODEL = "claude-opus-4-7"

@@ -3,4 +3,6 @@ __pycache__/
 .env
 venv/
 .venv/
+.venv-test/
+.pytest_cache/
 .claude/

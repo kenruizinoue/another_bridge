@@ -4,15 +4,45 @@ import time
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 
 from config import CLAUDE_MODEL, CODING_REPO_PATH
+from jobs import job_manager
+from routers.repos import _git_origin_url, _parse_owner_repo, validate_repo_path
+
+
+def _build_selected_repo_context(repo_path: str) -> dict[str, Any]:
+    """Shape the platform's __context__.selected_repo payload from a
+    resolved repo path. The platform persists this on the assistant
+    message and surfaces it in the next turn's [Conversation context]
+    block so the Developer Agent can read repo_path structurally instead
+    of parsing markdown out of conversation history.
+
+    owner_repo is best-effort — when the origin remote isn't a GitHub URL
+    (or no origin is configured), the field is omitted. The path + name
+    are always present.
+    """
+    out: dict[str, Any] = {
+        "path": repo_path,
+        "name": os.path.basename(repo_path.rstrip("/")),
+    }
+    origin_url = _git_origin_url(repo_path)
+    if origin_url:
+        owner_repo = _parse_owner_repo(origin_url)
+        if owner_repo:
+            out["owner_repo"] = owner_repo
+    return out
 
 log = structlog.get_logger()
 
 router = APIRouter()
 
-PLANNING_TIMEOUT_SECONDS = 900
+# 30 minutes — matches the platform's per-tool pollMaxSeconds (1800s) on
+# the async-webhook EM template, so the platform's poll budget and this
+# subprocess budget end together. If we cap shorter, the platform thinks
+# it has more time than we do, and a slightly long planning gets killed
+# here before the platform sees a result.
+PLANNING_TIMEOUT_SECONDS = 1800
 
 
 def _extract_args(body: Any) -> dict[str, Any]:
@@ -22,43 +52,14 @@ def _extract_args(body: Any) -> dict[str, Any]:
     return args
 
 
-@router.post("/tools/instruct_planning")
-async def instruct_planning(request: Request) -> dict[str, Any]:
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    args = _extract_args(body)
-    ticket_number_raw = args.get("ticket_number")
-    ticket_body = args.get("ticket_body")
-    repo_path = args.get("repo_path")
-
-    log.info(
-        "instruct_planning.request",
-        ticket_number=ticket_number_raw,
-        ticket_body_len=len(ticket_body) if isinstance(ticket_body, str) else None,
-        repo_path=repo_path,
-    )
-
-    try:
-        ticket_number = int(ticket_number_raw)
-    except (TypeError, ValueError):
-        log.error("instruct_planning.invalid_ticket_number", value=ticket_number_raw)
-        return {"error": "ticket_number is required and must be an integer"}
-
-    if not isinstance(ticket_body, str) or not ticket_body.strip():
-        log.error("instruct_planning.missing_ticket_body")
-        return {"error": "ticket_body is required and must be a non-empty string"}
-
-    resolved_repo_path = repo_path or CODING_REPO_PATH
-    if not resolved_repo_path:
-        log.error("instruct_planning.missing_repo_path")
-        return {"error": "repo_path not provided and CODING_REPO_PATH not configured"}
-    if not os.path.isdir(resolved_repo_path):
-        log.error("instruct_planning.repo_path_not_found", repo_path=resolved_repo_path)
-        return {"error": f"repo_path does not exist or is not a directory: {resolved_repo_path}"}
-
+def _run_planning_job(
+    job_id: str,
+    ticket_number: int,
+    ticket_body: str,
+    resolved_repo_path: str,
+) -> None:
+    """Runs the actual Claude planning subprocess. Called in a BackgroundTask
+    so the HTTP response returns immediately with the job_id."""
     workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
 
     prompt = (
@@ -82,6 +83,7 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
 
     log.info(
         "instruct_planning.running_claude",
+        job_id=job_id,
         ticket_number=ticket_number,
         model=CLAUDE_MODEL,
         repo_path=resolved_repo_path,
@@ -110,11 +112,12 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         duration = round(time.time() - started, 2)
         log.error(
             "instruct_planning.timeout",
+            job_id=job_id,
             ticket_number=ticket_number,
             duration_seconds=duration,
-            repo_path=resolved_repo_path,
         )
-        return {"error": "timeout", "duration_seconds": duration, "repo_path": resolved_repo_path}
+        job_manager.mark_failed(job_id, f"timeout after {duration}s")
+        return
 
     duration = round(time.time() - started, 2)
 
@@ -122,31 +125,90 @@ async def instruct_planning(request: Request) -> dict[str, Any]:
         stderr = (result.stderr or "").strip()
         log.error(
             "instruct_planning.claude_failed",
+            job_id=job_id,
             ticket_number=ticket_number,
             exit_code=result.returncode,
             stderr=stderr,
             duration_seconds=duration,
-            repo_path=resolved_repo_path,
         )
-        return {
-            "error": stderr or "claude exited non-zero",
-            "exit_code": result.returncode,
-            "duration_seconds": duration,
-            "repo_path": resolved_repo_path,
-        }
+        job_manager.mark_failed(job_id, stderr or f"claude exited with code {result.returncode}")
+        return
 
     plan = (result.stdout or "").strip()
     log.info(
         "instruct_planning.ok",
+        job_id=job_id,
         ticket_number=ticket_number,
         plan_len=len(plan),
         duration_seconds=duration,
-        repo_path=resolved_repo_path,
     )
+    job_manager.mark_done(
+        job_id,
+        {
+            "plan": plan,
+            "ticket_number": ticket_number,
+            "repo_path": resolved_repo_path,
+            "exit_code": 0,
+            "duration_seconds": duration,
+            # The platform strips __context__ from the LLM-visible response
+            # body and persists each key as a context artifact on the
+            # assistant message. Next turn's prompt injects them as
+            # [Conversation context] so the Developer Agent reads
+            # selected_repo.path directly instead of parsing markdown.
+            "__context__": {
+                "selected_repo": _build_selected_repo_context(resolved_repo_path),
+            },
+        },
+    )
+
+
+@router.post("/tools/instruct_planning")
+async def instruct_planning(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    args = _extract_args(body)
+    ticket_number_raw = args.get("ticket_number")
+    ticket_body = args.get("ticket_body")
+    repo_path = args.get("repo_path")
+
+    log.info(
+        "instruct_planning.request",
+        ticket_number=ticket_number_raw,
+        ticket_body_len=len(ticket_body) if isinstance(ticket_body, str) else None,
+        repo_path=repo_path,
+    )
+
+    try:
+        ticket_number = int(ticket_number_raw)
+    except (TypeError, ValueError):
+        return {"error": "ticket_number is required and must be an integer"}
+
+    if not isinstance(ticket_body, str) or not ticket_body.strip():
+        return {"error": "ticket_body is required and must be a non-empty string"}
+
+    resolved_repo_path = repo_path or CODING_REPO_PATH
+    if not resolved_repo_path:
+        return {"error": "repo_path not provided and CODING_REPO_PATH not configured"}
+    resolved_repo_path, err = validate_repo_path(resolved_repo_path)
+    if err:
+        return {"error": err}
+
+    job = job_manager.create(kind="instruct_planning")
+    background_tasks.add_task(
+        _run_planning_job,
+        job.job_id,
+        ticket_number,
+        ticket_body,
+        resolved_repo_path,
+    )
+
+    log.info("instruct_planning.dispatched", job_id=job.job_id, ticket_number=ticket_number)
     return {
-        "plan": plan,
-        "ticket_number": ticket_number,
-        "repo_path": resolved_repo_path,
-        "exit_code": 0,
-        "duration_seconds": duration,
+        "job_id": job.job_id,
+        "kind": "instruct_planning",
+        "status": "running",
+        "status_url": f"/jobs/{job.job_id}/status",
     }
