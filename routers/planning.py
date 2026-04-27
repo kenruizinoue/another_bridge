@@ -128,8 +128,12 @@ def _run_planning_job(
     )
     started = time.time()
 
+    # Popen (not subprocess.run) so we can attach the process to the job
+    # and let an external cancel send SIGTERM. start_new_session puts
+    # claude in its own process group so killpg also reaches any
+    # descendants Claude Code spawns (git, file tools, mcp servers).
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "claude",
                 "-p",
@@ -140,12 +144,24 @@ def _run_planning_job(
                 "text",
                 "--dangerously-skip-permissions",
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=PLANNING_TIMEOUT_SECONDS,
             cwd=resolved_repo_path,
+            start_new_session=True,
         )
+    except FileNotFoundError as err:
+        log.error("instruct_planning.spawn_failed", job_id=job_id, err=str(err))
+        job_manager.mark_failed(job_id, f"failed to spawn claude: {err}")
+        return
+
+    job_manager.attach_process(job_id, proc)
+
+    try:
+        stdout, stderr = proc.communicate(timeout=PLANNING_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         duration = round(time.time() - started, 2)
         log.error(
             "instruct_planning.timeout",
@@ -155,23 +171,37 @@ def _run_planning_job(
         )
         job_manager.mark_failed(job_id, f"timeout after {duration}s")
         return
+    finally:
+        job_manager.detach_process(job_id)
 
     duration = round(time.time() - started, 2)
 
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
+    # Cancel arrived during the run → SIGTERM/SIGKILL killed Claude;
+    # whatever stdout it produced is incomplete and not worth surfacing.
+    if job_manager.is_cancelled(job_id):
+        log.info(
+            "instruct_planning.cancelled",
+            job_id=job_id,
+            ticket_number=ticket_number,
+            duration_seconds=duration,
+        )
+        job_manager.mark_failed(job_id, "cancelled by client")
+        return
+
+    if proc.returncode != 0:
+        stderr_text = (stderr or "").strip()
         log.error(
             "instruct_planning.claude_failed",
             job_id=job_id,
             ticket_number=ticket_number,
-            exit_code=result.returncode,
-            stderr=stderr,
+            exit_code=proc.returncode,
+            stderr=stderr_text,
             duration_seconds=duration,
         )
-        job_manager.mark_failed(job_id, stderr or f"claude exited with code {result.returncode}")
+        job_manager.mark_failed(job_id, stderr_text or f"claude exited with code {proc.returncode}")
         return
 
-    raw_output = (result.stdout or "").strip()
+    raw_output = (stdout or "").strip()
     plan, summary = split_plan_and_summary(raw_output)
     log.info(
         "instruct_planning.ok",
@@ -256,4 +286,8 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
         "kind": "instruct_planning",
         "status": "running",
         "status_url": f"/jobs/{job.job_id}/status",
+        # The platform fires this best-effort when the user cancels the
+        # chat turn so the Claude Code subprocess actually stops instead
+        # of running to completion with its result silently dropped.
+        "cancel_url": f"/jobs/{job.job_id}/cancel",
     }

@@ -1,11 +1,26 @@
+import os
+import signal
+import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import structlog
+
 
 JobStatus = Literal["running", "done", "failed"]
+
+# Grace period between SIGTERM and SIGKILL when a cancel request comes
+# in. Claude Code subprocesses usually exit cleanly on SIGTERM (they
+# stream output and check signals between LLM rounds), so this gives
+# them a beat before we hard-kill. Tunable; 3s is a balance between
+# "give it time to flush" and "the user clicked cancel and wants it
+# gone NOW".
+SIGKILL_GRACE_SECONDS = 3.0
+
+log = structlog.get_logger()
 
 
 @dataclass
@@ -17,6 +32,16 @@ class Job:
     finished_at: float | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    # When True, an external cancel request fired. The runner that owns
+    # this job should detect it after subprocess exit and mark_failed
+    # with the cancel marker instead of mark_done with a (now stale)
+    # result. Setting it does not by itself terminate the subprocess —
+    # JobManager.cancel handles the SIGTERM/SIGKILL escalation.
+    cancelled: bool = False
+    # Held only while the underlying Claude Code subprocess is alive.
+    # Reset to None once the process exits so JobManager.cancel on a
+    # finished job is a clean no-op.
+    process: subprocess.Popen | None = field(default=None, repr=False)
 
     def elapsed_seconds(self) -> float:
         end = self.finished_at if self.finished_at is not None else time.time()
@@ -55,14 +80,119 @@ class JobManager:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def attach_process(self, job_id: str, proc: subprocess.Popen) -> None:
+        """Register the running subprocess so an external cancel can
+        signal it. If a cancel arrived BEFORE the process spawned (rare
+        race; cancel mid-spawn), kill it immediately rather than letting
+        the runner run a process the client already gave up on."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job.process = proc
+            already_cancelled = job.cancelled
+        if already_cancelled:
+            self._terminate_process(proc, job_id, reason="cancel-before-attach")
+
+    def detach_process(self, job_id: str) -> None:
+        """Drop the subprocess reference once it's exited. Keeps cancel()
+        from operating on an already-reaped pid."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.process = None
+
+    def is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job and job.cancelled)
+
+    def cancel(self, job_id: str) -> bool:
+        """Mark the job cancelled and signal its subprocess to terminate.
+        Returns True when a job with this id existed (and a kill was
+        attempted if a process was attached). Returns False for unknown
+        job_ids. Safe to call on already-finished jobs — no-op.
+
+        Sends SIGTERM first; a background timer escalates to SIGKILL
+        after SIGKILL_GRACE_SECONDS if the process hasn't exited. The
+        runner detects job.cancelled after the process exits and writes
+        a 'cancelled' failure status."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            if job.status != "running":
+                # Already done / failed — nothing to kill, nothing to flag.
+                return True
+            job.cancelled = True
+            proc = job.process
+
+        if proc is None:
+            # Cancel arrived before the subprocess was attached. The
+            # cancel flag is set, so attach_process will kill it on
+            # arrival. Common when cancel races with kickoff.
+            log.info("job.cancel.no_process_yet", job_id=job_id)
+            return True
+
+        self._terminate_process(proc, job_id, reason="cancel")
+        return True
+
+    def _terminate_process(
+        self, proc: subprocess.Popen, job_id: str, reason: str
+    ) -> None:
+        """Send SIGTERM, then SIGKILL after the grace period if needed.
+        Wrapped in try/except since the process may have just exited on
+        its own — that's a benign race, not an error."""
+        try:
+            if proc.poll() is None:
+                # SIGTERM the process group so any descendants Claude
+                # Code spawned (git, file tools, etc.) also stop. Falls
+                # back to a single-process kill on platforms where
+                # process groups aren't available.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    proc.terminate()
+                log.info("job.cancel.sigterm_sent", job_id=job_id, pid=proc.pid, reason=reason)
+        except Exception as err:
+            log.warning("job.cancel.sigterm_failed", job_id=job_id, err=str(err))
+            return
+
+        # Escalate to SIGKILL after grace period if process is still
+        # alive. Run in a daemon thread so we don't block the cancel
+        # response.
+        def _escalate() -> None:
+            time.sleep(SIGKILL_GRACE_SECONDS)
+            try:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        proc.kill()
+                    log.warning("job.cancel.sigkill_sent", job_id=job_id, pid=proc.pid)
+            except Exception as err:
+                log.warning("job.cancel.sigkill_failed", job_id=job_id, err=str(err))
+
+        threading.Thread(target=_escalate, daemon=True).start()
+
     def mark_done(self, job_id: str, result: dict[str, Any]) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return
+            # Don't overwrite a cancellation. If cancel landed before
+            # the runner finished its bookkeeping, the cancel must win
+            # — the user already gave up on this result.
+            if job.cancelled and job.status == "running":
+                job.status = "failed"
+                job.error = "cancelled by client"
+                job.finished_at = time.time()
+                job.process = None
+                return
             job.status = "done"
             job.result = result
             job.finished_at = time.time()
+            job.process = None
 
     def mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -70,8 +200,11 @@ class JobManager:
             if job is None:
                 return
             job.status = "failed"
-            job.error = error
+            # Surface the cancel reason explicitly; otherwise use the
+            # caller-supplied error verbatim.
+            job.error = "cancelled by client" if job.cancelled else error
             job.finished_at = time.time()
+            job.process = None
 
 
 # Module-level singleton — every router shares the same in-memory store.

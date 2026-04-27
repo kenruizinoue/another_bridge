@@ -297,8 +297,11 @@ def _run_implementation_job(
         branch_name=branch_name,
     )
 
+    # Popen + attach so an external cancel can SIGTERM Claude (and any
+    # tools it spawned via the new process group). Mirrors the planning
+    # path — see jobs.JobManager.cancel for escalation semantics.
     try:
-        claude_result = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "claude",
                 "-p",
@@ -309,14 +312,42 @@ def _run_implementation_job(
                 "text",
                 "--dangerously-skip-permissions",
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=IMPLEMENTATION_TIMEOUT_SECONDS,
             cwd=resolved_repo_path,
+            start_new_session=True,
         )
+    except FileNotFoundError as err:
+        fail(f"failed to spawn claude: {err}", branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
+        return
+
+    job_manager.attach_process(job_id, proc)
+
+    try:
+        claude_stdout, claude_stderr = proc.communicate(timeout=IMPLEMENTATION_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         fail("claude timed out", branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
         return
+    finally:
+        job_manager.detach_process(job_id)
+
+    # Cancel arrived during the run → reflect it in job status. Any
+    # half-written branch + working-tree changes Claude left behind are
+    # NOT cleaned up here; that's a follow-up if it becomes a problem.
+    if job_manager.is_cancelled(job_id):
+        log.info("instruct_implementation.cancelled", job_id=job_id, ticket_number=ticket_number, branch_name=branch_name)
+        job_manager.mark_failed(job_id, "cancelled by client")
+        return
+
+    # Synthesize a CompletedProcess-shaped object so the rest of the
+    # function (which reads claude_result.returncode / .stdout / .stderr)
+    # doesn't have to change.
+    claude_result = subprocess.CompletedProcess(
+        args=proc.args, returncode=proc.returncode, stdout=claude_stdout, stderr=claude_stderr
+    )
 
     if claude_result.returncode != 0:
         stderr = (claude_result.stderr or "").strip()
@@ -554,4 +585,6 @@ async def instruct_implementation(request: Request, background_tasks: Background
         "kind": "instruct_implementation",
         "status": "running",
         "status_url": f"/jobs/{job.job_id}/status",
+        # See planning.py for the cancel-propagation contract.
+        "cancel_url": f"/jobs/{job.job_id}/cancel",
     }
