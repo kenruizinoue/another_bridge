@@ -1,12 +1,14 @@
 """Tests for the payload _run_planning_job hands to job_manager.mark_done.
 
 The platform's blob dedup relies on `__label__` being present and
-formatted as `ticket-<N>-plan` for every plan iteration of the same
-ticket. If the format ever drifts (refactor renames it, someone tweaks
-the f-string, or the field gets removed entirely) the dedup breaks
-silently — the platform sees different labels for what should be the
-same logical artifact, both blobs render in next-turn prompts, and
-the user re-experiences the original "blob accumulation" bug.
+formatted as `plan-<repo_short_name>-<N>` for every plan iteration of
+the same (repo, ticket) pair. If the format ever drifts (refactor
+renames it, someone tweaks the f-string, drops the repo segment, or
+the field gets removed entirely) the dedup breaks silently — the
+platform either sees different labels for what should be the same
+logical artifact (blob accumulation returns), or worse, sees the same
+label for plans of different tickets/repos (cross-repo collision; one
+plan supersedes another it has nothing to do with).
 
 This is the regression test that locks the contract.
 
@@ -115,17 +117,17 @@ class TestLabelFormat:
             "payload must include __label__ — without it the platform "
             "cannot dedup plan iterations"
         )
-        assert payload["__label__"] == "ticket-42-plan", (
-            "label format MUST stay ticket-<N>-plan — changing it "
-            "breaks dedup for previously-stored plans"
+        assert payload["__label__"] == "plan-fake-repo-42", (
+            "label format MUST stay plan-<repo>-<N> — changing it "
+            "breaks dedup for previously-stored plans and risks "
+            "cross-repo collisions when ticket numbers overlap"
         )
 
     def test_label_uses_provided_ticket_number_verbatim(
         self, stub_popen, captured_payload: dict[str, Any]
     ) -> None:
         # Defensive: if the f-string ever loses {ticket_number}, every
-        # ticket would dedup against everything else. Spot-check a
-        # different number than above.
+        # ticket in the same repo would dedup against everything else.
         stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
 
         planning_router._run_planning_job(
@@ -135,7 +137,7 @@ class TestLabelFormat:
             resolved_repo_path="/tmp/fake-repo",
         )
 
-        assert captured_payload["payload"]["__label__"] == "ticket-104-plan"
+        assert captured_payload["payload"]["__label__"] == "plan-fake-repo-104"
 
     def test_label_present_even_when_summary_missing(
         self, stub_popen, captured_payload: dict[str, Any]
@@ -154,7 +156,7 @@ class TestLabelFormat:
         )
 
         payload = captured_payload["payload"]
-        assert payload["__label__"] == "ticket-7-plan"
+        assert payload["__label__"] == "plan-fake-repo-7"
         assert "__summary__" not in payload  # confirms independence
 
     def test_label_present_when_summary_present(
@@ -173,8 +175,102 @@ class TestLabelFormat:
         )
 
         payload = captured_payload["payload"]
-        assert payload["__label__"] == "ticket-1-plan"
+        assert payload["__label__"] == "plan-fake-repo-1"
         assert payload["__summary__"] == "tight one-liner"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Repo isolation — the bug this format change fixed
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestRepoIsolation:
+    """Earlier label format `ticket-<N>-plan` collided across repos:
+    plan ticket #2 in `another_coder` then plan ticket #2 in
+    `another_agent_backend` and the second plan would supersede the
+    first in the next-turn render — even though they're plans for
+    completely different work. The new format `plan-<repo>-<N>` keeps
+    them isolated. These tests lock that down."""
+
+    def test_label_uses_repo_short_name_from_path(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        # Long absolute path with workspace prefix, exactly like
+        # production. The label should pick up just the basename.
+        stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
+
+        planning_router._run_planning_job(
+            job_id="j",
+            ticket_number=2,
+            ticket_body="body",
+            resolved_repo_path="/Users/x/Desktop/AnohterAgent Projects/another_coder",
+        )
+
+        assert captured_payload["payload"]["__label__"] == "plan-another_coder-2"
+
+    def test_same_ticket_different_repos_get_different_labels(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        # The actual regression: ticket #2 in repo A and ticket #2 in
+        # repo B must NOT collide. Run the job twice with the same
+        # ticket number but different repo paths and confirm the
+        # labels diverge.
+        stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
+
+        planning_router._run_planning_job(
+            job_id="job-A",
+            ticket_number=2,
+            ticket_body="body",
+            resolved_repo_path="/workspace/another_coder",
+        )
+        label_a = captured_payload["payload"]["__label__"]
+
+        # Reset stub_popen so the second call also has a value
+        stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
+
+        planning_router._run_planning_job(
+            job_id="job-B",
+            ticket_number=2,
+            ticket_body="body",
+            resolved_repo_path="/workspace/another_agent_backend",
+        )
+        label_b = captured_payload["payload"]["__label__"]
+
+        assert label_a == "plan-another_coder-2"
+        assert label_b == "plan-another_agent_backend-2"
+        assert label_a != label_b, (
+            "same ticket number in different repos MUST produce "
+            "different labels — otherwise one plan supersedes another "
+            "unrelated one in the conversation artifacts render"
+        )
+
+    def test_label_handles_trailing_slash_in_repo_path(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        # Defensive: os.path.basename of `/foo/bar/` is "" without
+        # rstrip. The f-string uses .rstrip('/') so both forms produce
+        # the same label. If the strip ever gets dropped, dedup keys
+        # would diverge between callers passing trailing-slash and not.
+        stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
+
+        planning_router._run_planning_job(
+            job_id="j1",
+            ticket_number=5,
+            ticket_body="body",
+            resolved_repo_path="/workspace/myrepo/",
+        )
+        with_slash = captured_payload["payload"]["__label__"]
+
+        stub_popen.Popen.return_value = _StubProcCompleted(stdout="...")
+        planning_router._run_planning_job(
+            job_id="j2",
+            ticket_number=5,
+            ticket_body="body",
+            resolved_repo_path="/workspace/myrepo",
+        )
+        without_slash = captured_payload["payload"]["__label__"]
+
+        assert with_slash == without_slash == "plan-myrepo-5"
 
 
 # ──────────────────────────────────────────────────────────────────────

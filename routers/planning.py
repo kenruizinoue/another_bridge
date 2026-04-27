@@ -269,12 +269,16 @@ def _run_planning_job(
         },
         # The platform strips __label__ from the LLM-visible response
         # body and uses it as the artifact's dedup key. Plan iterations
-        # for the same ticket share this label, so the next-turn
-        # [Conversation artifacts] block shows ONLY the latest plan
-        # (older versions stay in storage and remain fetchable by id).
-        # Without this, every refinement would add another visible blob
-        # ref, polluting the prompt as the user iterates.
-        "__label__": f"ticket-{ticket_number}-plan",
+        # for the same (repo, ticket_number) share this label, so the
+        # next-turn [Conversation artifacts] block shows ONLY the latest
+        # plan (older versions stay in storage and remain fetchable by
+        # id). Repo is included so the same ticket number filed in two
+        # different repos doesn't collide — `plan-another_coder-2`
+        # and `plan-another_agent_backend-2` are independent.
+        "__label__": (
+            f"plan-{os.path.basename(resolved_repo_path.rstrip('/'))}"
+            f"-{ticket_number}"
+        ),
     }
     # The platform strips __summary__ from the LLM-visible response body
     # and stashes it as the artifact's `summary` field. Shown in every
