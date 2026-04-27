@@ -8,7 +8,11 @@ ignores the instruction or the output is truncated, the helper returns
 None for summary and the platform's auto-summary fallback takes over.
 """
 
-from routers.planning import split_plan_and_summary
+from routers.planning import (
+    detect_target_repo_mismatch,
+    split_plan_and_summary,
+    strip_target_repo_mismatch_marker,
+)
 
 
 class TestSplitPlanAndSummary:
@@ -78,3 +82,64 @@ class TestSplitPlanAndSummary:
         plan, summary = split_plan_and_summary("")
         assert plan == ""
         assert summary is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TARGET_REPO_MISMATCH marker — wrong-repo signaling from Claude Code
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestTargetRepoMismatch:
+    """Claude Code appends `TARGET_REPO_MISMATCH: true` when it detects
+    the ticket was filed against the wrong repo. The platform reads this
+    to suppress the selected_repo context emission so the wrong-repo run
+    doesn't silently overwrite the prior turn's correct selection."""
+
+    def test_detect_returns_true_when_marker_present(self):
+        out = (
+            "## Plan\n\nThis ticket is misfiled — work belongs in sibling.\n\n"
+            "SUMMARY: zero-step wrong-repo response\n"
+            "TARGET_REPO_MISMATCH: true"
+        )
+        assert detect_target_repo_mismatch(out) is True
+
+    def test_detect_returns_false_when_marker_absent(self):
+        out = "## Plan\n\n1. Step one\n2. Step two\n\nSUMMARY: normal plan"
+        assert detect_target_repo_mismatch(out) is False
+
+    def test_detect_is_case_insensitive(self):
+        # Defensive: an LLM might emit "true" / "TRUE" / "True" depending
+        # on prompt drift. Accept all common casings.
+        for value in ["true", "True", "TRUE"]:
+            out = f"plan body\n\nTARGET_REPO_MISMATCH: {value}"
+            assert detect_target_repo_mismatch(out) is True, value
+
+    def test_detect_only_matches_full_marker_line(self):
+        # Defensive: the literal string might appear inside a plan step
+        # (e.g. "we should add a TARGET_REPO_MISMATCH: true assertion").
+        # Only count it as the marker when it stands alone on its own line.
+        # Use a leading newline so MULTILINE matches against ^.
+        out_inline = "Plan\n\n1. Add `TARGET_REPO_MISMATCH: true` to the test"
+        # The whole step text is on one line (the bullet line) — and the
+        # marker substring is preceded by a backtick + space, not by a
+        # line start. Should NOT match.
+        assert detect_target_repo_mismatch(out_inline) is False
+
+    def test_strip_removes_marker_line(self):
+        out = "Plan body\n\nSUMMARY: foo\nTARGET_REPO_MISMATCH: true"
+        cleaned = strip_target_repo_mismatch_marker(out)
+        assert "TARGET_REPO_MISMATCH" not in cleaned
+        # SUMMARY line preserved (split_plan_and_summary handles it later)
+        assert "SUMMARY: foo" in cleaned
+
+    def test_strip_is_idempotent_when_marker_absent(self):
+        out = "Plan body\n\nSUMMARY: foo"
+        assert strip_target_repo_mismatch_marker(out) == out
+
+    def test_strip_handles_marker_in_middle(self):
+        # Edge case — Claude might put it before SUMMARY rather than
+        # after. Marker should still be removed regardless of position.
+        out = "Plan body\n\nTARGET_REPO_MISMATCH: true\n\nSUMMARY: foo"
+        cleaned = strip_target_repo_mismatch_marker(out)
+        assert "TARGET_REPO_MISMATCH" not in cleaned
+        assert "SUMMARY: foo" in cleaned

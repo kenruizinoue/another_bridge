@@ -303,3 +303,100 @@ class TestPayloadShape:
         assert "__context__" in p
         assert "selected_repo" in p["__context__"]
         assert "__label__" in p
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TARGET_REPO_MISMATCH — suppress selected_repo emission on wrong-repo runs
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestTargetRepoMismatchSuppression:
+    """When Claude Code appends `TARGET_REPO_MISMATCH: true`, the platform
+    must NOT emit __context__.selected_repo for this run. Without this
+    suppression, the wrong-repo run silently overwrites the prior turn's
+    correct selected_repo, and subsequent refinement turns default to
+    the wrong repo (cascade error). Bug repro from real chat session
+    where Planner refined a lunchy_box_frontend plan, the call defaulted
+    to another_agent_frontend's CODING_REPO_PATH, and the resulting
+    'wrong repo' response replaced selected_repo with the wrong value."""
+
+    def test_suppresses_context_when_marker_present(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        stub_popen.Popen.return_value = _StubProcCompleted(
+            stdout=(
+                "## Plan\n\nThis ticket is misfiled — work belongs in "
+                "lunchy_box_frontend.\n\n"
+                "SUMMARY: zero-step wrong-repo response\n"
+                "TARGET_REPO_MISMATCH: true"
+            )
+        )
+
+        planning_router._run_planning_job(
+            job_id="job-x",
+            ticket_number=13,
+            ticket_body="body",
+            resolved_repo_path="/tmp/wrong-repo",
+        )
+
+        p = captured_payload["payload"]
+        assert "__context__" not in p, (
+            "wrong-repo runs MUST NOT emit selected_repo — doing so "
+            "overwrites the prior turn's correct selection and corrupts "
+            "the conversation's repo state for every subsequent turn"
+        )
+        # Other fields still present — the run completed, just produced
+        # no actionable plan.
+        assert p["plan"]  # non-empty (the "wrong repo" explanation)
+        assert "TARGET_REPO_MISMATCH" not in p["plan"], (
+            "marker must be stripped from the LLM-visible plan field"
+        )
+        assert p["__label__"] == "plan-wrong-repo-13"  # label still emitted
+
+    def test_emits_context_normally_when_marker_absent(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        # Sanity: the suppression logic only triggers on the marker.
+        # Normal plans must still emit selected_repo as before.
+        stub_popen.Popen.return_value = _StubProcCompleted(
+            stdout="## Plan\n\n1. step one\n2. step two\n\nSUMMARY: real plan"
+        )
+
+        planning_router._run_planning_job(
+            job_id="job-y",
+            ticket_number=14,
+            ticket_body="body",
+            resolved_repo_path="/tmp/right-repo",
+        )
+
+        p = captured_payload["payload"]
+        assert "__context__" in p
+        assert "selected_repo" in p["__context__"]
+        # The autouse _stub_repo_helpers fixture returns a hardcoded
+        # context regardless of input path — sanity-check the structure
+        # is present rather than the specific name.
+        assert p["__context__"]["selected_repo"]["name"] == "fake-repo"
+
+    def test_summary_still_extracted_when_marker_present(
+        self, stub_popen, captured_payload: dict[str, Any]
+    ) -> None:
+        # Even on a wrong-repo response, the SUMMARY line should still
+        # parse correctly. The marker strip happens BEFORE the summary
+        # split so neither field contaminates the other.
+        stub_popen.Popen.return_value = _StubProcCompleted(
+            stdout=(
+                "Wrong repo explanation.\n\n"
+                "SUMMARY: ticket misfiled, recommend re-filing\n"
+                "TARGET_REPO_MISMATCH: true"
+            )
+        )
+
+        planning_router._run_planning_job(
+            job_id="job-z",
+            ticket_number=13,
+            ticket_body="body",
+            resolved_repo_path="/tmp/wrong-repo",
+        )
+
+        p = captured_payload["payload"]
+        assert p["__summary__"] == "ticket misfiled, recommend re-filing"

@@ -18,6 +18,32 @@ from routers.repos import _git_origin_url, _parse_owner_repo, validate_repo_path
 # rendered in the next-turn [Conversation artifacts] block).
 _SUMMARY_LINE_RE = re.compile(r"\n\s*SUMMARY:\s*(.+?)\s*$", re.DOTALL)
 
+# Matches `TARGET_REPO_MISMATCH: true` anywhere on its own line. When
+# Claude Code determines the ticket was filed against the wrong repo
+# (per TARGET-REPO DISCIPLINE in the planning prompt), it appends this
+# marker so the platform knows to SUPPRESS the selected_repo context
+# emission. Without that suppression the wrong-repo run silently
+# overwrites the prior turn's correct selected_repo, and the Planner
+# then defaults to the wrong repo on subsequent refinement turns —
+# cascade error.
+_TARGET_REPO_MISMATCH_RE = re.compile(
+    r"^\s*TARGET_REPO_MISMATCH:\s*true\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def detect_target_repo_mismatch(claude_output: str) -> bool:
+    """Returns True when Claude Code flagged this run as targeting the
+    wrong repo. Pure helper for testability."""
+    return bool(_TARGET_REPO_MISMATCH_RE.search(claude_output))
+
+
+def strip_target_repo_mismatch_marker(claude_output: str) -> str:
+    """Removes the marker line from the visible plan text so the LLM
+    consumer doesn't see the platform-internal control flag. Idempotent
+    — returns the input unchanged when the marker is absent."""
+    return _TARGET_REPO_MISMATCH_RE.sub("", claude_output).rstrip()
+
 
 def split_plan_and_summary(claude_output: str) -> tuple[str, str | None]:
     """Split Claude's planning output into (plan, summary).
@@ -115,6 +141,13 @@ def _run_planning_job(
         f"       Then either (a) write a small in-this-repo plan for whatever\n"
         f"       fragment IS in scope here, or (b) if nothing in this repo,\n"
         f"       output zero numbered steps and explain.\n"
+        f"       AND: when you produce a wrong-repo response, append a new line\n"
+        f"       at the very end of your output (after SUMMARY, if present):\n"
+        f"           TARGET_REPO_MISMATCH: true\n"
+        f"       This signals the platform to suppress the `selected_repo`\n"
+        f"       context emission for this turn — without it, the wrong-repo\n"
+        f"       run silently overwrites the prior turn's correct selection,\n"
+        f"       and subsequent turns default to the wrong repo too.\n"
         f"     - Do NOT write the bulk of the plan against sibling files. The\n"
         f"       implementer cannot execute it — the implementation will\n"
         f"       silently produce zero changes.\n"
@@ -244,13 +277,21 @@ def _run_planning_job(
         return
 
     raw_output = (stdout or "").strip()
-    plan, summary = split_plan_and_summary(raw_output)
+    # Detect + strip wrong-repo flag BEFORE splitting plan/summary so the
+    # marker doesn't leak into either field. When present, we skip the
+    # selected_repo context emission below — claiming "this repo" as
+    # selected when Claude itself said "this is the wrong repo" would
+    # corrupt the conversation's repo context for every subsequent turn.
+    target_repo_mismatch = detect_target_repo_mismatch(raw_output)
+    cleaned_output = strip_target_repo_mismatch_marker(raw_output)
+    plan, summary = split_plan_and_summary(cleaned_output)
     log.info(
         "instruct_planning.ok",
         job_id=job_id,
         ticket_number=ticket_number,
         plan_len=len(plan),
         summary_present=summary is not None,
+        target_repo_mismatch=target_repo_mismatch,
         duration_seconds=duration,
     )
     payload: dict[str, Any] = {
@@ -259,14 +300,6 @@ def _run_planning_job(
         "repo_path": resolved_repo_path,
         "exit_code": 0,
         "duration_seconds": duration,
-        # The platform strips __context__ from the LLM-visible response
-        # body and persists each key as a context artifact on the
-        # assistant message. Next turn's prompt injects them as
-        # [Conversation context] so the Developer Agent reads
-        # selected_repo.path directly instead of parsing markdown.
-        "__context__": {
-            "selected_repo": _build_selected_repo_context(resolved_repo_path),
-        },
         # The platform strips __label__ from the LLM-visible response
         # body and uses it as the artifact's dedup key. Plan iterations
         # for the same (repo, ticket_number) share this label, so the
@@ -280,6 +313,20 @@ def _run_planning_job(
             f"-{ticket_number}"
         ),
     }
+    # __context__ is emitted only when this run actually owns the work.
+    # When Claude Code flagged TARGET_REPO_MISMATCH, this run produced
+    # no actionable plan — claiming "this repo" as selected_repo would
+    # silently overwrite the prior turn's correct selection and cause
+    # subsequent refinements to default to the wrong repo. Suppress.
+    if not target_repo_mismatch:
+        # The platform strips __context__ from the LLM-visible response
+        # body and persists each key as a context artifact on the
+        # assistant message. Next turn's prompt injects them as
+        # [Conversation context] so the Developer Agent reads
+        # selected_repo.path directly instead of parsing markdown.
+        payload["__context__"] = {
+            "selected_repo": _build_selected_repo_context(resolved_repo_path),
+        }
     # The platform strips __summary__ from the LLM-visible response body
     # and stashes it as the artifact's `summary` field. Shown in every
     # subsequent turn's [Conversation artifacts] block, so the Developer
