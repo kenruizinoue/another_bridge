@@ -262,7 +262,19 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
         return {"error": "ticket_number is required and must be an integer"}
 
     if not isinstance(ticket_body, str) or not ticket_body.strip():
-        return {"error": "ticket_body is required and must be a non-empty string"}
+        # Hint the recovery path so the LLM (Planner Agent) can self-correct
+        # on its next pass without needing a prompt change. If the upstream
+        # github_get_issue returned an empty body, the agent should
+        # synthesize ticket_body from the issue title + the user's chat
+        # context, not bail.
+        return {
+            "error": (
+                "ticket_body is required and must be a non-empty string. "
+                "If the GitHub issue body is empty, build ticket_body from "
+                "the issue title plus the user's description in the chat "
+                "(do not pass empty)."
+            )
+        }
 
     resolved_repo_path = repo_path or CODING_REPO_PATH
     if not resolved_repo_path:

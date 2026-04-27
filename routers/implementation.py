@@ -555,7 +555,15 @@ async def instruct_implementation(request: Request, background_tasks: Background
         return {"error": "ticket_number is required and must be an integer"}
 
     if not isinstance(ticket_body, str) or not ticket_body.strip():
-        return {"error": "ticket_body is required and must be a non-empty string"}
+        # See planning.py — same recovery hint so the agent self-corrects.
+        return {
+            "error": (
+                "ticket_body is required and must be a non-empty string. "
+                "If the GitHub issue body is empty, build ticket_body from "
+                "the issue title plus the user's description in the chat "
+                "(do not pass empty)."
+            )
+        }
 
     if not isinstance(plan, str) or not plan.strip():
         return {"error": "plan is required and must be a non-empty string"}
