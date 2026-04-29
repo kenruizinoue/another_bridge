@@ -11,60 +11,36 @@ Exposes:
 When WORKSPACE_ROOT is unset, validate_repo_path falls back to the legacy
 "is it a directory?" check so existing CODING_REPO_PATH deployments keep
 working unchanged.
+
+Git URL parsing + origin lookup live in services.git_service. Re-exported
+here as `_git_origin_url` / `_parse_owner_repo` so callers that imported
+them from this module continue to work.
 """
 
 from __future__ import annotations
 
 import os
-import re
-import subprocess
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, Request
 
 from config import WORKSPACE_ROOT
+from services.git_service import _git_origin_url, _parse_owner_repo
+from services.request import extract_args
+
+# Back-compat re-exports — older code imports these from routers.repos.
+__all__ = [
+    "router",
+    "validate_repo_path",
+    "list_workspace_repos",
+    "_git_origin_url",
+    "_parse_owner_repo",
+]
 
 log = structlog.get_logger()
 
 router = APIRouter()
-
-
-def _extract_args(body: Any) -> dict[str, Any]:
-    args = body.get("arguments") if isinstance(body, dict) else None
-    if not isinstance(args, dict):
-        args = body if isinstance(body, dict) else {}
-    return args
-
-
-# Matches owner/repo at the end of a GitHub HTTPS or SSH URL, with or
-# without a trailing .git. Examples it parses:
-#   https://github.com/kenruizinoue/another_agent_frontend.git
-#   git@github.com:kenruizinoue/another_agent_frontend.git
-#   https://github.com/kenruizinoue/another_agent_frontend
-_GITHUB_URL_RE = re.compile(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$")
-
-
-def _parse_owner_repo(origin_url: str) -> str | None:
-    m = _GITHUB_URL_RE.search(origin_url.strip())
-    return f"{m.group(1)}/{m.group(2)}" if m else None
-
-
-def _git_origin_url(repo_dir: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if result.returncode != 0:
-        return None
-    url = result.stdout.strip()
-    return url or None
 
 
 def list_workspace_repos(workspace_root: str) -> list[dict[str, Any]]:
@@ -115,13 +91,10 @@ def validate_repo_path(
         return None, f"repo_path does not exist or is not a directory: {repo_path}"
 
     if not workspace_root:
-        # No allow-list configured — legacy behavior.
         return candidate, None
 
     workspace_resolved = os.path.realpath(os.path.expanduser(workspace_root))
 
-    # commonpath raises ValueError on different drives or mixed abs/rel —
-    # treat that as "not contained."
     try:
         common = os.path.commonpath([workspace_resolved, candidate])
     except ValueError:
@@ -145,7 +118,7 @@ async def list_repos(request: Request) -> dict[str, Any]:
         body = await request.json()
     except Exception:
         body = {}
-    _ = _extract_args(body)  # no args today; reserved for future filters
+    _ = extract_args(body)  # no args today; reserved for future filters
 
     log.info("list_repos.request", workspace_root=WORKSPACE_ROOT)
 

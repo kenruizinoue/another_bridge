@@ -12,42 +12,35 @@ plan supersedes another it has nothing to do with).
 
 This is the regression test that locks the contract.
 
-Mocks subprocess.Popen + the build-helpers so the planning job runs
-synchronously in-test without spawning Claude. We're testing the
-payload shape, not the subprocess machinery (covered separately in
-test_jobs_cancel.py).
+Mocks claude_runner.run_blocking + the build-helpers so the planning
+job runs synchronously in-test without spawning Claude. We're testing
+the payload shape, not the subprocess machinery (covered separately
+in test_jobs_cancel.py).
 """
 
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from jobs import job_manager
 from routers import planning as planning_router
+from services import claude_runner
 
 
-class _StubProcCompleted:
-    """Stand-in for subprocess.Popen that already finished cleanly with
-    a known stdout. Mirrors the Popen surface _run_planning_job touches:
-    args, returncode, communicate (returns stdout/stderr tuple), pid."""
-
-    def __init__(self, stdout: str, returncode: int = 0) -> None:
-        self.args: list[str] = ["claude"]
-        self.pid = 99999
-        self.returncode = returncode
-        self._stdout = stdout
-
-    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
-        return (self._stdout, "")
-
-    def poll(self) -> int | None:
-        return self.returncode
-
-    def kill(self) -> None:  # pragma: no cover — never called on completed proc
-        pass
+def _make_result(stdout: str, returncode: int = 0) -> claude_runner.ClaudeResult:
+    """Build a ClaudeResult that looks like a clean (or non-zero-exit)
+    blocking run. Tests configure stdout to drive the parser path."""
+    return claude_runner.ClaudeResult(
+        returncode=returncode,
+        stdout=stdout,
+        stderr="",
+        timed_out=False,
+        cancelled=False,
+        duration_seconds=0.5,
+    )
 
 
 @pytest.fixture
@@ -63,20 +56,72 @@ def captured_payload() -> dict[str, Any]:
         yield box
 
 
+class _StubRunBlocking:
+    """Configurable stand-in for claude_runner.run_blocking. Tests set
+    `.return_value` to a ClaudeResult and the planner picks it up. Mirrors
+    the original Popen-mock ergonomics so each test can stage a different
+    stdout per call."""
+
+    def __init__(self) -> None:
+        self.return_value: claude_runner.ClaudeResult = _make_result("")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> claude_runner.ClaudeResult:
+        return self.return_value
+
+
 @pytest.fixture
 def stub_popen():
-    """Patches subprocess.Popen in the planning module so the runner
-    doesn't try to spawn `claude`. Returns the patcher so individual
-    tests can configure stdout per case."""
-    with patch.object(planning_router, "subprocess") as mock_sub:
-        # Mirror the real submodule shape the runner uses.
-        mock_sub.PIPE = -1  # arbitrary sentinel; we never read it
-        mock_sub.TimeoutExpired = type("TimeoutExpired", (Exception,), {})
-        # Also forward CompletedProcess for any fallback paths.
-        import subprocess as real_subprocess
+    """Patches claude_runner.run_blocking so the planning runner doesn't
+    spawn `claude`. Name kept as `stub_popen` so existing test bodies
+    that set `stub_popen.Popen.return_value = _StubProcCompleted(...)`
+    keep reading. The shim translates the legacy assignment into the
+    new ClaudeResult shape transparently."""
 
-        mock_sub.CompletedProcess = real_subprocess.CompletedProcess
-        yield mock_sub
+    class _LegacyShim:
+        """Bridges the old `stub_popen.Popen.return_value = _StubProcCompleted(...)`
+        assignment style to the new run_blocking-patch model. Each test still
+        reads natural — no rewrites of test bodies — and the shim builds a
+        ClaudeResult from the stub proc's stdout/returncode."""
+
+        def __init__(self, run_stub: _StubRunBlocking) -> None:
+            self._run = run_stub
+            self.Popen = self  # so `stub_popen.Popen.return_value = X` works
+
+        @property
+        def return_value(self) -> Any:
+            return None
+
+        @return_value.setter
+        def return_value(self, stub_proc: Any) -> None:
+            self._run.return_value = _make_result(
+                stdout=getattr(stub_proc, "_stdout", ""),
+                returncode=getattr(stub_proc, "returncode", 0),
+            )
+
+    run_stub = _StubRunBlocking()
+    with patch.object(claude_runner, "run_blocking", run_stub):
+        yield _LegacyShim(run_stub)
+
+
+class _StubProcCompleted:
+    """Stand-in matching the legacy Popen-stub shape used in test bodies.
+    Only the stdout + returncode fields are read by the shim — the rest
+    exist for any test that introspects them."""
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.args: list[str] = ["claude"]
+        self.pid = 99999
+        self.returncode = returncode
+        self._stdout = stdout
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return (self._stdout, "")
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:  # pragma: no cover
+        pass
 
 
 @pytest.fixture(autouse=True)

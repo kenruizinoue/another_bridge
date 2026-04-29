@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import threading
 from typing import Optional
 
@@ -11,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from config import CLAUDE_MODEL
 from jobs import job_manager
+from services import claude_runner
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -194,14 +194,7 @@ def chat_stream(req: ChatStreamRequest):
             },
         )
 
-        cmd = [
-            "claude",
-            "-p",
-            req.message,
-            "--model",
-            CLAUDE_MODEL,
-            "--output-format",
-            "stream-json",
+        extra_flags = [
             # stream-json requires --verbose so Claude Code emits the
             # full event sequence (system init, per-block events) instead
             # of a single batched JSON at end.
@@ -213,7 +206,14 @@ def chat_stream(req: ChatStreamRequest):
             "bypassPermissions",
         ]
         if prev_session_id:
-            cmd.extend(["--resume", prev_session_id])
+            extra_flags.extend(["--resume", prev_session_id])
+
+        cmd = claude_runner.build_claude_args(
+            prompt=req.message,
+            model=CLAUDE_MODEL,
+            output_format="stream-json",
+            extra_flags=extra_flags,
+        )
 
         log.info(
             "chat_stream.spawning",
@@ -223,66 +223,53 @@ def chat_stream(req: ChatStreamRequest):
             repo_path=repo_path,
         )
 
+        captured_session_id: Optional[str] = None
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                # Line buffered so JSONL lines flush as Claude emits them
-                # instead of pooling into a 4KB block. Without this, the
-                # browser sees no SSE chunks until ~4KB of text accumulates.
-                bufsize=1,
+            with claude_runner.streaming_subprocess(
+                args=cmd,
                 cwd=repo_path,
-                # Fresh process group so killpg reaches every descendant
-                # Claude Code spawns (git, file tools, mcp servers).
-                start_new_session=True,
-            )
+                job_id=job.job_id,
+            ) as proc:
+                for raw_line in proc.stdout:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        # Stray non-JSON output (e.g. Claude Code warnings) —
+                        # log at debug and skip rather than crashing the stream.
+                        log.warning("chat_stream.non_json_line", line=line[:200])
+                        continue
+
+                    # First system init carries the session_id — stash it for
+                    # the post-stream session map write. Subsequent system
+                    # events are ignored for now (v2 could surface them).
+                    sid = _extract_session_id(event)
+                    if sid and not captured_session_id:
+                        captured_session_id = sid
+
+                    text = _extract_text_chunk(event)
+                    if text:
+                        # Mirror the SSE chunk into the job's accumulated_text
+                        # buffer so polling clients (mobile reconnect path) see
+                        # the same content that streaming clients see, in the
+                        # same order. Append happens BEFORE yield so a poll
+                        # racing with a chunk can never see a chunk that the
+                        # streaming client has already received but the buffer
+                        # hasn't recorded yet.
+                        job_manager.append_text(job.job_id, text)
+                        yield _sse_event("text", {"chunk": text})
+
+                proc.wait()
+                returncode = proc.returncode
+                stderr_text = (proc.stderr.read() if proc.stderr else "").strip()
         except FileNotFoundError as err:
             log.error("chat_stream.spawn_failed", job_id=job.job_id, err=str(err))
             yield _sse_event("error", {"error": f"failed to spawn claude: {err}"})
             job_manager.mark_failed(job.job_id, f"spawn failed: {err}")
             return
-
-        job_manager.attach_process(job.job_id, proc)
-        captured_session_id: Optional[str] = None
-
-        try:
-            for raw_line in proc.stdout:
-                line = raw_line.strip()
-                if not line:
-                    continue
-
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # Stray non-JSON output (e.g. Claude Code warnings) —
-                    # log at debug and skip rather than crashing the stream.
-                    log.warning("chat_stream.non_json_line", line=line[:200])
-                    continue
-
-                # First system init carries the session_id — stash it for
-                # the post-stream session map write. Subsequent system
-                # events are ignored for now (v2 could surface them).
-                sid = _extract_session_id(event)
-                if sid and not captured_session_id:
-                    captured_session_id = sid
-
-                text = _extract_text_chunk(event)
-                if text:
-                    # Mirror the SSE chunk into the job's accumulated_text
-                    # buffer so polling clients (mobile reconnect path) see
-                    # the same content that streaming clients see, in the
-                    # same order. Append happens BEFORE yield so a poll
-                    # racing with a chunk can never see a chunk that the
-                    # streaming client has already received but the buffer
-                    # hasn't recorded yet.
-                    job_manager.append_text(job.job_id, text)
-                    yield _sse_event("text", {"chunk": text})
-
-            proc.wait()
-        finally:
-            job_manager.detach_process(job.job_id)
 
         # Cancel arrived during the run -> SIGTERM/SIGKILL killed Claude;
         # surface the cancel to the platform as an explicit error so the
@@ -298,21 +285,20 @@ def chat_stream(req: ChatStreamRequest):
             job_manager.mark_failed(job.job_id, "cancelled by client")
             return
 
-        if proc.returncode != 0:
-            stderr_text = (proc.stderr.read() if proc.stderr else "").strip()
+        if returncode != 0:
             log.error(
                 "chat_stream.claude_failed",
                 job_id=job.job_id,
                 conversation_id=conversation_id,
-                exit_code=proc.returncode,
+                exit_code=returncode,
                 stderr=stderr_text[:500],
             )
             yield _sse_event(
                 "error",
-                {"error": stderr_text or f"claude exited with code {proc.returncode}"},
+                {"error": stderr_text or f"claude exited with code {returncode}"},
             )
             job_manager.mark_failed(
-                job.job_id, stderr_text or f"claude exited with code {proc.returncode}"
+                job.job_id, stderr_text or f"claude exited with code {returncode}"
             )
             return
 

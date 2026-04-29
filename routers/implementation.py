@@ -3,121 +3,53 @@ import subprocess
 import time
 from typing import Any
 
-import requests
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Request
 
-from config import BASE_BRANCH, CLAUDE_MODEL, CODING_REPO_PATH, GITHUB_API_BASE, GITHUB_DEFAULT_REPO, GITHUB_PAT
-from routers.planning import _build_selected_repo_context
-from routers.repos import _git_origin_url, _parse_owner_repo, validate_repo_path
+from config import CLAUDE_MODEL, CODING_REPO_PATH, GITHUB_DEFAULT_REPO, GITHUB_PAT
 from jobs import job_manager
+from routers.repos import validate_repo_path
+from services import claude_runner, github_service
+from services.git_service import (
+    _branch_exists_locally,
+    _branch_exists_on_remote,
+    _git_origin_url,
+    _parse_owner_repo,
+    _resolve_base_branch,
+    _run_git,
+)
+from services.github_service import format_pr_creation_error
+from services.repo_context import build_selected_repo_context
+from services.request import extract_args
+
+# Re-exports — tests in test_implementation_pr_creation patch
+# routers.implementation._git_origin_url and import
+# resolve_pr_repo_slug / format_pr_creation_error from this module.
+# Keeping the names accessible here means those tests don't have to
+# learn the new service module path.
+__all__ = [
+    "router",
+    "format_pr_creation_error",
+    "resolve_pr_repo_slug",
+    "_git_origin_url",
+    "_parse_owner_repo",
+]
+
+# Cross-router re-export so other code that imported _build_selected_repo_context
+# from this module (none today, but planning.py used to be the source) keeps
+# working.
+_build_selected_repo_context = build_selected_repo_context
 
 log = structlog.get_logger()
 
 router = APIRouter()
 
-GIT_TIMEOUT_SECONDS = 60
 # 30 minutes — matches the platform's per-tool pollMaxSeconds (1800s) on
 # the async-webhook EM template, so a long implementation pass isn't
 # cut short here before the platform's poll budget would have allowed
 # it to complete.
 IMPLEMENTATION_TIMEOUT_SECONDS = 1800
 PUSH_TIMEOUT_SECONDS = 120
-
-
-def _extract_args(body: Any) -> dict[str, Any]:
-    args = body.get("arguments") if isinstance(body, dict) else None
-    if not isinstance(args, dict):
-        args = body if isinstance(body, dict) else {}
-    return args
-
-
-def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        timeout=GIT_TIMEOUT_SECONDS,
-    )
-
-
-def _branch_exists_locally(branch: str, cwd: str) -> bool:
-    return _run_git(["rev-parse", "--verify", "--quiet", branch], cwd).returncode == 0
-
-
-def _branch_exists_on_remote(branch: str, cwd: str) -> bool:
-    return _run_git(["ls-remote", "--exit-code", "--heads", "origin", branch], cwd).returncode == 0
-
-
-def _detect_default_branch(cwd: str) -> str | None:
-    """Read the remote's default branch via `git ls-remote --symref origin HEAD`.
-
-    Output looks like:
-        ref: refs/heads/main	HEAD
-        abc123...	HEAD
-
-    Returns the branch name (e.g. "main") or None if detection fails (no
-    network, no origin, malformed output, etc.). Never raises — callers
-    fall back to BASE_BRANCH.
-    """
-    result = _run_git(["ls-remote", "--symref", "origin", "HEAD"], cwd)
-    if result.returncode != 0:
-        return None
-    for line in (result.stdout or "").splitlines():
-        # Match `ref: refs/heads/<name>\tHEAD`
-        if line.startswith("ref:") and "refs/heads/" in line:
-            try:
-                ref_part = line.split("ref:", 1)[1].strip().split("\t", 1)[0].strip()
-                # ref_part = "refs/heads/main"
-                if ref_part.startswith("refs/heads/"):
-                    return ref_part[len("refs/heads/") :]
-            except (IndexError, ValueError):
-                continue
-    return None
-
-
-def _resolve_base_branch(
-    cwd: str, override: str | None = None
-) -> tuple[str | None, str | None]:
-    """Resolve the base branch to use for an implementation, in order:
-
-    1. `override` (caller-supplied, e.g. agent passed `base_branch=feat/foo`)
-    2. The remote's default branch via _detect_default_branch (zero-config —
-       works automatically across repos that use main/master/dev/etc.)
-    3. `BASE_BRANCH` env (legacy fallback for pre-detection deployments)
-
-    Each candidate must exist on origin. If a higher-priority candidate
-    is set but doesn't exist, return that error verbatim — don't silently
-    skip to the next, because the user/operator's intent should win.
-    """
-    # 1. Explicit caller override takes priority
-    if override:
-        if not _branch_exists_on_remote(override, cwd):
-            return None, f"requested base_branch '{override}' does not exist on origin"
-        return override, None
-
-    # 2. Auto-detect from origin's HEAD symref (zero-config path)
-    detected = _detect_default_branch(cwd)
-    if detected:
-        # _detect_default_branch already proved the ref exists on origin
-        # (it came from origin's symref response). Skip the existence check.
-        return detected, None
-
-    # 3. Legacy fallback: BASE_BRANCH env (kept for deployments that
-    #    relied on it before auto-detect existed).
-    if BASE_BRANCH:
-        if not _branch_exists_on_remote(BASE_BRANCH, cwd):
-            return None, (
-                f"could not auto-detect default branch and BASE_BRANCH "
-                f"fallback '{BASE_BRANCH}' does not exist on origin"
-            )
-        return BASE_BRANCH, None
-
-    return None, (
-        "could not auto-detect remote default branch and no BASE_BRANCH "
-        "env or base_branch arg provided"
-    )
 
 
 def resolve_pr_repo_slug(
@@ -135,134 +67,28 @@ def resolve_pr_repo_slug(
     (no origin configured, non-GitHub URL, malformed). Returns None when
     neither source yields a usable slug — caller should fail loud rather
     than guess.
+
+    Defined in this router (not services/github_service) because it
+    crosses git origin lookup + PR-target selection. The local
+    `_git_origin_url` binding is the one tests patch — keeping the
+    function here means those patches still resolve correctly without
+    forcing test rewrites.
     """
     origin_url = _git_origin_url(repo_path)
     derived_slug = _parse_owner_repo(origin_url) if origin_url else None
     return derived_slug or (github_default_repo or None)
 
 
-def format_pr_creation_error(
-    status_code: int,
-    response_text: str,
-    branch_name: str,
-    repo_slug: str,
-    base_branch: str,
-    repo_path: str,
-) -> str:
-    """Format the PR-creation error message returned to the user.
-
-    Enriches the canonical "branch was pushed but PR API can't see it"
-    case (HTTP 422 with `field:head, code:invalid`) with diagnose+fix
-    commands and a manual-PR URL, so the user can resolve in 30 seconds
-    without digging through coder logs. With the resolve_pr_repo_slug
-    fix in place, the only remaining way to hit this error is a renamed
-    GitHub repo with a stale local origin.
-
-    Other errors pass through verbatim.
-    """
-    is_head_invalid = (
-        status_code == 422
-        and '"field":"head"' in response_text
-        and '"code":"invalid"' in response_text
-    )
-    if is_head_invalid:
-        return (
-            f"GitHub PR API 422 (head invalid): branch '{branch_name}' was "
-            f"pushed to {repo_slug} but the PR creation API can't see it. "
-            f"This usually means the repo was renamed on GitHub but your "
-            f"local clone's origin URL still points at the old name.\n"
-            f"\n"
-            f"Diagnose:  cd '{repo_path}' && git remote -v\n"
-            f"Fix:       cd '{repo_path}' && git remote set-url "
-            f"origin https://github.com/<correct-owner>/<correct-repo>.git\n"
-            f"\n"
-            f"Your code changes ARE on GitHub at branch '{branch_name}' — "
-            f"you can open the PR manually if you prefer not to retry. "
-            f"Visit: https://github.com/{repo_slug}/compare/{base_branch}..."
-            f"{branch_name}\n"
-            f"\n"
-            f"Original API response: {response_text}"
-        )
-    return f"GitHub PR API {status_code}: {response_text}"
-
-
-def _run_implementation_job(
-    job_id: str,
+def _build_implementation_prompt(
     ticket_number: int,
     ticket_body: str,
     plan: str,
     resolved_repo_path: str,
-    base_branch_override: str | None = None,
-) -> None:
-    """All git + Claude + push + PR work runs here in a BackgroundTask. Updates
-    job_manager throughout so the platform poller sees real-time status."""
-    started = time.time()
-    branch_name = f"agent/ticket-{ticket_number}"
-
-    def fail(msg: str, **extra: Any) -> None:
-        log.error("instruct_implementation.failed", job_id=job_id, error=msg, **extra)
-        job_manager.mark_failed(job_id, msg)
-
-    # Verify it's actually a git repo
-    git_dir_check = _run_git(["rev-parse", "--git-dir"], resolved_repo_path)
-    if git_dir_check.returncode != 0:
-        fail(f"{resolved_repo_path} is not a git repository")
-        return
-
-    # Verify working tree is clean
-    status_check = _run_git(["status", "--porcelain"], resolved_repo_path)
-    if status_check.returncode != 0:
-        fail(f"git status failed: {status_check.stderr.strip()}")
-        return
-    if status_check.stdout.strip():
-        fail(
-            "working tree is not clean — commit or stash your changes before implementing",
-            status_output=status_check.stdout.strip()[:500],
-        )
-        return
-
-    # Resolve configured base branch (dev by default)
-    base_branch, detect_err = _resolve_base_branch(resolved_repo_path, base_branch_override)
-    if detect_err or base_branch is None:
-        fail(detect_err or "base branch resolution failed")
-        return
-
-    # Abort early if the target branch already exists anywhere
-    if _branch_exists_locally(branch_name, resolved_repo_path):
-        fail(f"branch '{branch_name}' already exists locally — delete it or bump the ticket")
-        return
-    if _branch_exists_on_remote(branch_name, resolved_repo_path):
-        fail(f"branch '{branch_name}' already exists on origin — delete it or bump the ticket")
-        return
-
-    # Sync base branch
-    checkout_base = _run_git(["checkout", base_branch], resolved_repo_path)
-    if checkout_base.returncode != 0:
-        fail(f"could not checkout {base_branch}: {checkout_base.stderr.strip()}")
-        return
-
-    pull = _run_git(["pull", "--ff-only", "origin", base_branch], resolved_repo_path)
-    if pull.returncode != 0:
-        fail(f"could not pull latest {base_branch}: {pull.stderr.strip()}")
-        return
-
-    # Create the working branch
-    create = _run_git(["checkout", "-b", branch_name], resolved_repo_path)
-    if create.returncode != 0:
-        fail(f"could not create branch {branch_name}: {create.stderr.strip()}")
-        return
-
-    log.info(
-        "instruct_implementation.branch_created",
-        job_id=job_id,
-        branch_name=branch_name,
-        base_branch=base_branch,
-        repo_path=resolved_repo_path,
-    )
-
-    # Run Claude
-    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
-    implement_prompt = (
+    branch_name: str,
+    base_branch: str,
+    workspace_dir: str,
+) -> str:
+    return (
         f"You are implementing Ticket #{ticket_number} in the repo at {resolved_repo_path}.\n"
         f"You are currently on branch {branch_name}, branched from {base_branch}.\n\n"
         f"TICKET:\n{ticket_body.strip()}\n\n"
@@ -304,6 +130,86 @@ def _run_implementation_job(
         f"- If you hit a blocker you cannot resolve, commit whatever works and explain the blocker in your final output."
     )
 
+
+def _run_implementation_job(
+    job_id: str,
+    ticket_number: int,
+    ticket_body: str,
+    plan: str,
+    resolved_repo_path: str,
+    base_branch_override: str | None = None,
+) -> None:
+    """All git + Claude + push + PR work runs here in a BackgroundTask. Updates
+    job_manager throughout so the platform poller sees real-time status."""
+    started = time.time()
+    branch_name = f"agent/ticket-{ticket_number}"
+
+    def fail(msg: str, **extra: Any) -> None:
+        log.error("instruct_implementation.failed", job_id=job_id, error=msg, **extra)
+        job_manager.mark_failed(job_id, msg)
+
+    git_dir_check = _run_git(["rev-parse", "--git-dir"], resolved_repo_path)
+    if git_dir_check.returncode != 0:
+        fail(f"{resolved_repo_path} is not a git repository")
+        return
+
+    status_check = _run_git(["status", "--porcelain"], resolved_repo_path)
+    if status_check.returncode != 0:
+        fail(f"git status failed: {status_check.stderr.strip()}")
+        return
+    if status_check.stdout.strip():
+        fail(
+            "working tree is not clean — commit or stash your changes before implementing",
+            status_output=status_check.stdout.strip()[:500],
+        )
+        return
+
+    base_branch, detect_err = _resolve_base_branch(resolved_repo_path, base_branch_override)
+    if detect_err or base_branch is None:
+        fail(detect_err or "base branch resolution failed")
+        return
+
+    if _branch_exists_locally(branch_name, resolved_repo_path):
+        fail(f"branch '{branch_name}' already exists locally — delete it or bump the ticket")
+        return
+    if _branch_exists_on_remote(branch_name, resolved_repo_path):
+        fail(f"branch '{branch_name}' already exists on origin — delete it or bump the ticket")
+        return
+
+    checkout_base = _run_git(["checkout", base_branch], resolved_repo_path)
+    if checkout_base.returncode != 0:
+        fail(f"could not checkout {base_branch}: {checkout_base.stderr.strip()}")
+        return
+
+    pull = _run_git(["pull", "--ff-only", "origin", base_branch], resolved_repo_path)
+    if pull.returncode != 0:
+        fail(f"could not pull latest {base_branch}: {pull.stderr.strip()}")
+        return
+
+    create = _run_git(["checkout", "-b", branch_name], resolved_repo_path)
+    if create.returncode != 0:
+        fail(f"could not create branch {branch_name}: {create.stderr.strip()}")
+        return
+
+    log.info(
+        "instruct_implementation.branch_created",
+        job_id=job_id,
+        branch_name=branch_name,
+        base_branch=base_branch,
+        repo_path=resolved_repo_path,
+    )
+
+    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
+    implement_prompt = _build_implementation_prompt(
+        ticket_number=ticket_number,
+        ticket_body=ticket_body,
+        plan=plan,
+        resolved_repo_path=resolved_repo_path,
+        branch_name=branch_name,
+        base_branch=base_branch,
+        workspace_dir=workspace_dir,
+    )
+
     log.info(
         "instruct_implementation.running_claude",
         job_id=job_id,
@@ -313,63 +219,34 @@ def _run_implementation_job(
         branch_name=branch_name,
     )
 
-    # Popen + attach so an external cancel can SIGTERM Claude (and any
-    # tools it spawned via the new process group). Mirrors the planning
-    # path — see jobs.JobManager.cancel for escalation semantics.
-    try:
-        proc = subprocess.Popen(
-            [
-                "claude",
-                "-p",
-                implement_prompt,
-                "--model",
-                CLAUDE_MODEL,
-                "--output-format",
-                "text",
-                "--dangerously-skip-permissions",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=resolved_repo_path,
-            start_new_session=True,
-        )
-    except FileNotFoundError as err:
-        fail(f"failed to spawn claude: {err}", branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
+    result = claude_runner.run_blocking(
+        args=claude_runner.build_claude_args(prompt=implement_prompt, model=CLAUDE_MODEL),
+        cwd=resolved_repo_path,
+        timeout_seconds=IMPLEMENTATION_TIMEOUT_SECONDS,
+        job_id=job_id,
+    )
+
+    if result.spawn_error:
+        fail(result.spawn_error, branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
         return
 
-    job_manager.attach_process(job_id, proc)
-
-    try:
-        claude_stdout, claude_stderr = proc.communicate(timeout=IMPLEMENTATION_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
+    if result.timed_out:
         fail("claude timed out", branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
         return
-    finally:
-        job_manager.detach_process(job_id)
 
     # Cancel arrived during the run → reflect it in job status. Any
     # half-written branch + working-tree changes Claude left behind are
     # NOT cleaned up here; that's a follow-up if it becomes a problem.
-    if job_manager.is_cancelled(job_id):
+    if result.cancelled:
         log.info("instruct_implementation.cancelled", job_id=job_id, ticket_number=ticket_number, branch_name=branch_name)
         job_manager.mark_failed(job_id, "cancelled by client")
         return
 
-    # Synthesize a CompletedProcess-shaped object so the rest of the
-    # function (which reads claude_result.returncode / .stdout / .stderr)
-    # doesn't have to change.
-    claude_result = subprocess.CompletedProcess(
-        args=proc.args, returncode=proc.returncode, stdout=claude_stdout, stderr=claude_stderr
-    )
-
-    if claude_result.returncode != 0:
-        stderr = (claude_result.stderr or "").strip()
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
         fail(
-            stderr or f"claude exited with code {claude_result.returncode}",
-            exit_code=claude_result.returncode,
+            stderr or f"claude exited with code {result.returncode}",
+            exit_code=result.returncode,
             branch_name=branch_name,
         )
         return
@@ -384,7 +261,6 @@ def _run_implementation_job(
             resolved_repo_path,
         )
 
-    # Count commits + enumerate files changed vs base
     commits_count_raw = _run_git(["rev-list", "--count", f"origin/{base_branch}..HEAD"], resolved_repo_path)
     try:
         commits = int(commits_count_raw.stdout.strip() or "0")
@@ -398,11 +274,10 @@ def _run_implementation_job(
         fail(
             "claude produced no commits and no file changes",
             branch_name=branch_name,
-            claude_output=(claude_result.stdout or "").strip()[:500],
+            claude_output=result.stdout.strip()[:500],
         )
         return
 
-    # Push the branch
     push_result = subprocess.run(
         ["git", "push", "-u", "origin", branch_name],
         capture_output=True,
@@ -450,20 +325,12 @@ def _run_implementation_job(
         fail("GITHUB_PAT not configured — cannot create PR", branch_name=branch_name)
         return
 
-    pr_resp = requests.post(
-        f"{GITHUB_API_BASE}/repos/{repo_slug}/pulls",
-        headers={
-            "Authorization": f"Bearer {GITHUB_PAT}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        json={
-            "title": pr_title,
-            "body": pr_body,
-            "head": branch_name,
-            "base": base_branch,
-        },
-        timeout=30,
+    pr_resp = github_service.create_pr(
+        repo_slug=repo_slug,
+        title=pr_title,
+        body=pr_body,
+        head=branch_name,
+        base=base_branch,
     )
     if not pr_resp.ok:
         fail(
@@ -485,7 +352,6 @@ def _run_implementation_job(
     pr_url = pr_data.get("html_url")
     pr_number = pr_data.get("number")
 
-    # Switch back to base so the repo is ready for the next ticket
     checkout_back = _run_git(["checkout", base_branch], resolved_repo_path)
     if checkout_back.returncode != 0:
         log.warning(
@@ -519,14 +385,14 @@ def _run_implementation_job(
             "files_changed": files_changed,
             "pr_number": pr_number,
             "pr_url": pr_url,
-            "claude_output": (claude_result.stdout or "").strip(),
+            "claude_output": result.stdout.strip(),
             "duration_seconds": total_duration,
             # Cross-turn context for the platform — see planning.py for the
             # full mechanism. instruct_implementation knows more than
             # planning does (the branch + the PR URL), so we surface those
             # too in case a downstream agent on a later turn needs them.
             "__context__": {
-                "selected_repo": _build_selected_repo_context(resolved_repo_path),
+                "selected_repo": build_selected_repo_context(resolved_repo_path),
                 "current_branch": branch_name,
                 "last_pr_url": pr_url,
             },
@@ -541,7 +407,7 @@ async def instruct_implementation(request: Request, background_tasks: Background
     except Exception:
         body = {}
 
-    args = _extract_args(body)
+    args = extract_args(body)
     ticket_number_raw = args.get("ticket_number")
     ticket_body = args.get("ticket_body")
     plan = args.get("plan")
@@ -564,7 +430,6 @@ async def instruct_implementation(request: Request, background_tasks: Background
         base_branch_override=base_branch_override,
     )
 
-    # Fast input validation — return errors immediately, don't burn a job_id
     try:
         ticket_number = int(ticket_number_raw)
     except (TypeError, ValueError):
@@ -591,7 +456,6 @@ async def instruct_implementation(request: Request, background_tasks: Background
     if err:
         return {"error": err}
 
-    # Dispatch the heavy work to a background task; return job_id immediately
     job = job_manager.create(kind="instruct_implementation")
     background_tasks.add_task(
         _run_implementation_job,

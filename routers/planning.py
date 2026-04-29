@@ -1,7 +1,5 @@
 import os
 import re
-import subprocess
-import time
 from typing import Any
 
 import structlog
@@ -9,7 +7,15 @@ from fastapi import APIRouter, BackgroundTasks, Request
 
 from config import CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
-from routers.repos import _git_origin_url, _parse_owner_repo, validate_repo_path
+from routers.repos import validate_repo_path
+from services import claude_runner
+from services.repo_context import build_selected_repo_context
+from services.request import extract_args
+
+# Tests patch routers.planning._build_selected_repo_context (autouse fixture
+# in test_planning_payload). Keep the underscore-prefixed alias so the
+# patch target stays valid without forcing test rewrites.
+_build_selected_repo_context = build_selected_repo_context
 
 
 # Matches a trailing `SUMMARY: <text>` line in Claude's output. The plan
@@ -66,28 +72,6 @@ def split_plan_and_summary(claude_output: str) -> tuple[str, str | None]:
     return plan, summary
 
 
-def _build_selected_repo_context(repo_path: str) -> dict[str, Any]:
-    """Shape the platform's __context__.selected_repo payload from a
-    resolved repo path. The platform persists this on the assistant
-    message and surfaces it in the next turn's [Conversation context]
-    block so the Developer Agent can read repo_path structurally instead
-    of parsing markdown out of conversation history.
-
-    owner_repo is best-effort — when the origin remote isn't a GitHub URL
-    (or no origin is configured), the field is omitted. The path + name
-    are always present.
-    """
-    out: dict[str, Any] = {
-        "path": repo_path,
-        "name": os.path.basename(repo_path.rstrip("/")),
-    }
-    origin_url = _git_origin_url(repo_path)
-    if origin_url:
-        owner_repo = _parse_owner_repo(origin_url)
-        if owner_repo:
-            out["owner_repo"] = owner_repo
-    return out
-
 log = structlog.get_logger()
 
 router = APIRouter()
@@ -100,24 +84,13 @@ router = APIRouter()
 PLANNING_TIMEOUT_SECONDS = 1800
 
 
-def _extract_args(body: Any) -> dict[str, Any]:
-    args = body.get("arguments") if isinstance(body, dict) else None
-    if not isinstance(args, dict):
-        args = body if isinstance(body, dict) else {}
-    return args
-
-
-def _run_planning_job(
-    job_id: str,
+def _build_planning_prompt(
     ticket_number: int,
     ticket_body: str,
     resolved_repo_path: str,
-) -> None:
-    """Runs the actual Claude planning subprocess. Called in a BackgroundTask
-    so the HTTP response returns immediately with the job_id."""
-    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
-
-    prompt = (
+    workspace_dir: str,
+) -> str:
+    return (
         f"You are planning work inside the repo located at {resolved_repo_path}. "
         f"Sibling repos live under {workspace_dir} — e.g. \"../<sibling_repo_name>\" "
         f"is reachable from here. You may READ files in sibling repos when the ticket "
@@ -193,6 +166,23 @@ def _run_planning_job(
         f"Ticket #{ticket_number}:\n{ticket_body.strip()}"
     )
 
+
+def _run_planning_job(
+    job_id: str,
+    ticket_number: int,
+    ticket_body: str,
+    resolved_repo_path: str,
+) -> None:
+    """Runs the actual Claude planning subprocess. Called in a BackgroundTask
+    so the HTTP response returns immediately with the job_id."""
+    workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
+    prompt = _build_planning_prompt(
+        ticket_number=ticket_number,
+        ticket_body=ticket_body,
+        resolved_repo_path=resolved_repo_path,
+        workspace_dir=workspace_dir,
+    )
+
     log.info(
         "instruct_planning.running_claude",
         job_id=job_id,
@@ -201,43 +191,22 @@ def _run_planning_job(
         repo_path=resolved_repo_path,
         workspace_dir=workspace_dir,
     )
-    started = time.time()
 
-    # Popen (not subprocess.run) so we can attach the process to the job
-    # and let an external cancel send SIGTERM. start_new_session puts
-    # claude in its own process group so killpg also reaches any
-    # descendants Claude Code spawns (git, file tools, mcp servers).
-    try:
-        proc = subprocess.Popen(
-            [
-                "claude",
-                "-p",
-                prompt,
-                "--model",
-                CLAUDE_MODEL,
-                "--output-format",
-                "text",
-                "--dangerously-skip-permissions",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=resolved_repo_path,
-            start_new_session=True,
-        )
-    except FileNotFoundError as err:
-        log.error("instruct_planning.spawn_failed", job_id=job_id, err=str(err))
-        job_manager.mark_failed(job_id, f"failed to spawn claude: {err}")
+    result = claude_runner.run_blocking(
+        args=claude_runner.build_claude_args(prompt=prompt, model=CLAUDE_MODEL),
+        cwd=resolved_repo_path,
+        timeout_seconds=PLANNING_TIMEOUT_SECONDS,
+        job_id=job_id,
+    )
+
+    if result.spawn_error:
+        log.error("instruct_planning.spawn_failed", job_id=job_id, err=result.spawn_error)
+        job_manager.mark_failed(job_id, result.spawn_error)
         return
 
-    job_manager.attach_process(job_id, proc)
+    duration = result.duration_seconds
 
-    try:
-        stdout, stderr = proc.communicate(timeout=PLANNING_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        duration = round(time.time() - started, 2)
+    if result.timed_out:
         log.error(
             "instruct_planning.timeout",
             job_id=job_id,
@@ -246,14 +215,10 @@ def _run_planning_job(
         )
         job_manager.mark_failed(job_id, f"timeout after {duration}s")
         return
-    finally:
-        job_manager.detach_process(job_id)
-
-    duration = round(time.time() - started, 2)
 
     # Cancel arrived during the run → SIGTERM/SIGKILL killed Claude;
     # whatever stdout it produced is incomplete and not worth surfacing.
-    if job_manager.is_cancelled(job_id):
+    if result.cancelled:
         log.info(
             "instruct_planning.cancelled",
             job_id=job_id,
@@ -263,20 +228,20 @@ def _run_planning_job(
         job_manager.mark_failed(job_id, "cancelled by client")
         return
 
-    if proc.returncode != 0:
-        stderr_text = (stderr or "").strip()
+    if result.returncode != 0:
+        stderr_text = result.stderr.strip()
         log.error(
             "instruct_planning.claude_failed",
             job_id=job_id,
             ticket_number=ticket_number,
-            exit_code=proc.returncode,
+            exit_code=result.returncode,
             stderr=stderr_text,
             duration_seconds=duration,
         )
-        job_manager.mark_failed(job_id, stderr_text or f"claude exited with code {proc.returncode}")
+        job_manager.mark_failed(job_id, stderr_text or f"claude exited with code {result.returncode}")
         return
 
-    raw_output = (stdout or "").strip()
+    raw_output = result.stdout.strip()
     # Detect + strip wrong-repo flag BEFORE splitting plan/summary so the
     # marker doesn't leak into either field. When present, we skip the
     # selected_repo context emission below — claiming "this repo" as
@@ -345,7 +310,7 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
     except Exception:
         body = {}
 
-    args = _extract_args(body)
+    args = extract_args(body)
     ticket_number_raw = args.get("ticket_number")
     ticket_body = args.get("ticket_body")
     repo_path = args.get("repo_path")

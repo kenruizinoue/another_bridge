@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from jobs import job_manager
 from routers import chat as chat_router
 from routers import jobs as jobs_router
+from services import claude_runner
 
 
 @pytest.fixture
@@ -165,7 +166,7 @@ class _StubProc:
 
 @pytest.fixture
 def stub_popen():
-    with patch.object(chat_router.subprocess, "Popen") as mock_popen:
+    with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
         mock_popen.return_value = _StubProc()
         yield mock_popen
 

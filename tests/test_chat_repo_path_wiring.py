@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from jobs import job_manager
 from routers import chat as chat_router
+from services import claude_runner
 
 
 @pytest.fixture
@@ -83,11 +84,11 @@ class _StubProc:
 
 @pytest.fixture
 def stub_popen():
-    """Patch subprocess.Popen at the routers.chat seam (the import the
-    endpoint actually uses) so we can capture the kwargs without
-    spawning a real claude subprocess. Returns the MagicMock so each
-    test can read .call_args off it."""
-    with patch.object(chat_router.subprocess, "Popen") as mock_popen:
+    """Patch subprocess.Popen at the services.claude_runner seam — that's
+    where the chat endpoint's spawn now goes through. Returns the
+    MagicMock so each test can read .call_args off it (cwd kwarg
+    still captured the same way)."""
+    with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
         mock_popen.return_value = _StubProc()
         yield mock_popen
 
