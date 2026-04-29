@@ -135,11 +135,12 @@ def chat_stream(req: ChatStreamRequest):
 
     Cancellation: registers with JobManager so POST /jobs/<id>/cancel
     sends SIGTERM (then SIGKILL after grace) to the subprocess group.
-    The platform's bridge dispatcher closes the SSE connection on user
-    cancel; without a registered job_id we can't propagate that to the
-    coder, so v2 should expose the job_id back to the platform (e.g. as
-    a header or in the first SSE event) so cancel-from-platform works
-    without the user having to know the coder-side job id.
+    The first SSE event we yield is a ``kickoff`` carrying ``jobId`` +
+    ``cancelUrl`` so the platform's bridge dispatcher can address the
+    job — when the user aborts, the dispatcher POSTs the cancel URL
+    and JobManager kills the subprocess. Mirrors the async-webhook
+    contract used by ``instruct_planning`` / ``instruct_implementation``,
+    so both bridge and async-webhook paths behave identically end-to-end.
     """
     conversation_id = req.conversation_id
     # Normalize before falling back: a paste-mangled value like
@@ -158,6 +159,21 @@ def chat_stream(req: ChatStreamRequest):
     job = job_manager.create("chat_stream")
 
     def stream_claude():
+        # Kickoff event MUST be the first thing emitted so the platform
+        # bridge dispatcher can capture the cancel URL before any text
+        # flows. We send a relative URL — the platform already knows the
+        # coder host from agent.llmConfig.coderUrl / app.coderUrl, so
+        # baking the absolute URL here would just couple another_coder
+        # to its public-facing host. Field name `cancelUrl` (camelCase)
+        # matches the async-webhook contract the platform already speaks.
+        yield _sse_event(
+            "kickoff",
+            {
+                "jobId": job.job_id,
+                "cancelUrl": f"/jobs/{job.job_id}/cancel",
+            },
+        )
+
         cmd = [
             "claude",
             "-p",

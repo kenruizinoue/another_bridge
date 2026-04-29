@@ -17,6 +17,7 @@ input → another_coder Popen'd that string verbatim → spawn failed with
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -189,3 +190,67 @@ class TestRepoPathNormalization:
 
         cwd = stub_popen.call_args.kwargs["cwd"]
         assert cwd == os.getcwd()
+
+
+class TestKickoffEvent:
+    """Cancel-propagation contract: /chat/stream MUST emit a kickoff SSE
+    event as the very first message, carrying jobId + cancelUrl. The
+    platform bridge dispatcher reads it to wire abort → cancel POST.
+    Without kickoff, the platform can't address the JobManager job and
+    the subprocess keeps running on the Mac after the user cancels —
+    exactly the bug this contract was added to prevent. Mirrors the
+    async-webhook cancel_url contract used by instruct_planning /
+    instruct_implementation so the two paths behave identically."""
+
+    def test_first_event_is_kickoff_with_jobid_and_cancel_url(
+        self, client: TestClient, stub_popen: MagicMock
+    ) -> None:
+        with client.stream(
+            "POST",
+            "/chat/stream",
+            json={"conversation_id": "conv-k1", "message": "hi"},
+        ) as resp:
+            # Decode the body so we can split on SSE block boundaries.
+            body = b"".join(resp.iter_bytes()).decode()
+
+        blocks = [b for b in body.split("\n\n") if b.strip()]
+        assert blocks, "expected at least one SSE event"
+
+        # The very first non-empty block must be the kickoff event.
+        first = blocks[0]
+        assert "event: kickoff" in first.splitlines()[0]
+        # Pull the data line and parse the JSON payload.
+        data_line = next(line for line in first.splitlines() if line.startswith("data:"))
+        payload = json.loads(data_line[len("data:") :].strip())
+        assert "jobId" in payload, "kickoff payload missing jobId"
+        assert isinstance(payload["jobId"], str) and payload["jobId"]
+        assert payload.get("cancelUrl") == f"/jobs/{payload['jobId']}/cancel"
+
+    def test_kickoff_jobid_matches_an_attached_jobmanager_job(
+        self, client: TestClient, stub_popen: MagicMock
+    ) -> None:
+        """The jobId in the kickoff event must be the same job_id that
+        JobManager has the subprocess registered against — otherwise
+        the platform's POST /jobs/<id>/cancel would 404 instead of
+        actually killing the subprocess. This locks the contract so a
+        future refactor that mints a separate "cancel id" for the
+        kickoff event (defensible but wrong) trips this test."""
+        with client.stream(
+            "POST",
+            "/chat/stream",
+            json={"conversation_id": "conv-k2", "message": "hi"},
+        ) as resp:
+            body = b"".join(resp.iter_bytes()).decode()
+
+        first = body.split("\n\n")[0]
+        data_line = next(line for line in first.splitlines() if line.startswith("data:"))
+        kickoff_job_id = json.loads(data_line[len("data:") :].strip())["jobId"]
+
+        # JobManager singleton should hold a job by this id (created by
+        # chat_stream and registered before the first SSE event).
+        from jobs import job_manager
+
+        assert job_manager.get(kickoff_job_id) is not None, (
+            "kickoff jobId is not addressable in JobManager — "
+            "POST /jobs/<id>/cancel from the platform would 404"
+        )
