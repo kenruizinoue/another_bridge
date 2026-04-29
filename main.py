@@ -10,7 +10,7 @@ from config import (
     CLAUDE_MODEL,
     TARGET_DIRECTORY,
 )
-from routers import github, health, implementation, jobs, legacy, planning, repos
+from routers import chat, github, health, implementation, jobs, legacy, planning, repos
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
@@ -37,3 +37,8 @@ app.include_router(repos.router)
 app.include_router(planning.router)
 app.include_router(implementation.router)
 app.include_router(legacy.router)
+# Chat streaming bridge — POST /chat/stream forwards a turn to a local
+# Claude Code subprocess and streams text back as SSE. Used by the
+# platform's claude_code engine bridge (see another_agent_backend's
+# src/graphs/nodes/generateResponse/bridge.ts).
+app.include_router(chat.router)

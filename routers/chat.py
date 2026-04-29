@@ -1,0 +1,293 @@
+import json
+import os
+import subprocess
+import threading
+from typing import Optional
+
+import structlog
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from config import CLAUDE_MODEL
+from jobs import job_manager
+
+log = structlog.get_logger()
+router = APIRouter()
+
+
+# Maps platform conversation_id -> Claude Code session_id so subsequent
+# messages on the same conversation continue the same Claude Code session
+# (--resume <id>). In-memory; lost on uvicorn restart. v2: persist to disk
+# or sqlite so a coder restart doesn't drop in-flight conversations.
+_session_map: dict[str, str] = {}
+_session_map_lock = threading.Lock()
+
+
+class ChatStreamRequest(BaseModel):
+    """Body shape sent by the platform's bridge dispatcher.
+
+    conversation_id is optional because the same endpoint can power a
+    one-shot test from curl/the dashboard Test button without a
+    conversation context — first message just spawns a fresh session.
+    """
+
+    conversation_id: Optional[str] = Field(default=None)
+    message: str
+    repo_path: Optional[str] = None
+
+
+def _sse_event(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def _extract_text_chunk(event: dict) -> Optional[str]:
+    """Pull user-visible text out of a Claude Code stream-json event.
+
+    Claude Code's --output-format stream-json emits multiple event types:
+    system init, assistant messages, tool_use blocks, tool_result blocks,
+    user echoes, and a final result event. For v1 we only forward text
+    blocks from assistant messages — tool calls / results are Claude
+    Code's internal work and surfacing them as chat tokens would be
+    confusing. v2 could pipe them through as bridge_tool_call SSE events
+    so the trace drawer renders them.
+    """
+    if event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    chunks: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+    return "".join(chunks) if chunks else None
+
+
+def _extract_session_id(event: dict) -> Optional[str]:
+    """Capture session_id from the system init event for --resume on follow-ups."""
+    if event.get("type") == "system" and event.get("subtype") == "init":
+        sid = event.get("session_id")
+        if isinstance(sid, str):
+            return sid
+    return None
+
+
+def normalize_repo_path(raw: Optional[str]) -> Optional[str]:
+    """Defensively rewrite paste-style escapes that Popen's cwd= won't accept.
+
+    Users (especially via mobile/voice or copy-paste from a terminal) tend
+    to enter paths the way the shell expects them — e.g.
+    ``/Users/me/AnohterAgent\\ Projects/repo`` with a literal backslash
+    before each space. Python's ``subprocess.Popen`` does NOT interpret
+    backslashes; it treats them as real characters in the path string,
+    which then doesn't exist on disk and the spawn fails with ``[Errno 2]
+    No such file or directory``.
+
+    This normalizer absorbs the most common shell-style escapes and the
+    ``~`` home shortcut so the bridge stays forgiving of paste errors.
+    Returns None when the input is empty / whitespace-only so the caller's
+    ``os.getcwd()`` fallback still kicks in.
+
+    Handled forms:
+      - ``\\ ``   -> ` `   (escaped space — the actual bug from the field)
+      - ``\\(`` / ``\\)``   -> ``(`` / ``)``  (escaped parens, e.g. ``Movies\\(2024\\)``)
+      - ``~`` / ``~/...``   -> expanded home (matches shell + Python convention)
+      - leading/trailing whitespace stripped
+
+    Intentionally NOT handled:
+      - generic ``\\X`` -> ``X`` (would silently corrupt legitimate Windows-
+        style paths if anyone ever tries one). Specific characters only.
+      - shell variables like ``$HOME``. Out of scope; ambiguous semantics.
+    """
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    # Order matters: do the targeted character replaces BEFORE expanding
+    # ``~`` so a path like ``~/AnohterAgent\ Projects`` works in one pass.
+    cleaned = cleaned.replace("\\ ", " ").replace("\\(", "(").replace("\\)", ")")
+    cleaned = os.path.expanduser(cleaned)
+    return cleaned
+
+
+@router.post("/chat/stream")
+def chat_stream(req: ChatStreamRequest):
+    """Bridge chat from the platform to a local Claude Code subprocess.
+
+    Wire format (SSE response) — kept tiny so the platform side stays
+    decoupled from Claude Code's specific stream-json shape:
+      event: text   data: {"chunk": "..."}
+      event: done   data: {"sessionId": "..."}
+      event: error  data: {"error": "..."}
+
+    Session continuity: first call spawns claude with --output-format
+    stream-json --verbose and captures session_id from the system init
+    event. Subsequent calls on the same conversation_id resume that
+    session via --resume <id>. In-memory map; lost on uvicorn restart
+    (acceptable v1 — worst case the next message starts a fresh session).
+
+    Cancellation: registers with JobManager so POST /jobs/<id>/cancel
+    sends SIGTERM (then SIGKILL after grace) to the subprocess group.
+    The platform's bridge dispatcher closes the SSE connection on user
+    cancel; without a registered job_id we can't propagate that to the
+    coder, so v2 should expose the job_id back to the platform (e.g. as
+    a header or in the first SSE event) so cancel-from-platform works
+    without the user having to know the coder-side job id.
+    """
+    conversation_id = req.conversation_id
+    # Normalize before falling back: a paste-mangled value like
+    # ``/Users/me/AnohterAgent\ Projects`` would otherwise pass the
+    # truthy check, hit Popen, and fail with [Errno 2]. Normalizer
+    # returns None for empty input so getcwd() still wins when nothing
+    # was supplied at all.
+    repo_path = normalize_repo_path(req.repo_path) or os.getcwd()
+
+    # Resolve previous session for this conversation if any
+    prev_session_id: Optional[str] = None
+    if conversation_id:
+        with _session_map_lock:
+            prev_session_id = _session_map.get(conversation_id)
+
+    job = job_manager.create("chat_stream")
+
+    def stream_claude():
+        cmd = [
+            "claude",
+            "-p",
+            req.message,
+            "--model",
+            CLAUDE_MODEL,
+            "--output-format",
+            "stream-json",
+            # stream-json requires --verbose so Claude Code emits the
+            # full event sequence (system init, per-block events) instead
+            # of a single batched JSON at end.
+            "--verbose",
+            # Mobile / unattended use — the user can't approve permission
+            # prompts from the platform UI. Same risk surface as the
+            # existing instruct_* tools the user already runs that way.
+            "--permission-mode",
+            "bypassPermissions",
+        ]
+        if prev_session_id:
+            cmd.extend(["--resume", prev_session_id])
+
+        log.info(
+            "chat_stream.spawning",
+            job_id=job.job_id,
+            conversation_id=conversation_id,
+            resumed=bool(prev_session_id),
+            repo_path=repo_path,
+        )
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                # Line buffered so JSONL lines flush as Claude emits them
+                # instead of pooling into a 4KB block. Without this, the
+                # browser sees no SSE chunks until ~4KB of text accumulates.
+                bufsize=1,
+                cwd=repo_path,
+                # Fresh process group so killpg reaches every descendant
+                # Claude Code spawns (git, file tools, mcp servers).
+                start_new_session=True,
+            )
+        except FileNotFoundError as err:
+            log.error("chat_stream.spawn_failed", job_id=job.job_id, err=str(err))
+            yield _sse_event("error", {"error": f"failed to spawn claude: {err}"})
+            job_manager.mark_failed(job.job_id, f"spawn failed: {err}")
+            return
+
+        job_manager.attach_process(job.job_id, proc)
+        captured_session_id: Optional[str] = None
+
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Stray non-JSON output (e.g. Claude Code warnings) —
+                    # log at debug and skip rather than crashing the stream.
+                    log.warning("chat_stream.non_json_line", line=line[:200])
+                    continue
+
+                # First system init carries the session_id — stash it for
+                # the post-stream session map write. Subsequent system
+                # events are ignored for now (v2 could surface them).
+                sid = _extract_session_id(event)
+                if sid and not captured_session_id:
+                    captured_session_id = sid
+
+                text = _extract_text_chunk(event)
+                if text:
+                    yield _sse_event("text", {"chunk": text})
+
+            proc.wait()
+        finally:
+            job_manager.detach_process(job.job_id)
+
+        # Cancel arrived during the run -> SIGTERM/SIGKILL killed Claude;
+        # surface the cancel to the platform as an explicit error so the
+        # bridge marks the assistant message as truncated/cancelled rather
+        # than silently treating partial output as the final response.
+        if job_manager.is_cancelled(job.job_id):
+            log.info(
+                "chat_stream.cancelled",
+                job_id=job.job_id,
+                conversation_id=conversation_id,
+            )
+            yield _sse_event("error", {"error": "cancelled by client"})
+            job_manager.mark_failed(job.job_id, "cancelled by client")
+            return
+
+        if proc.returncode != 0:
+            stderr_text = (proc.stderr.read() if proc.stderr else "").strip()
+            log.error(
+                "chat_stream.claude_failed",
+                job_id=job.job_id,
+                conversation_id=conversation_id,
+                exit_code=proc.returncode,
+                stderr=stderr_text[:500],
+            )
+            yield _sse_event(
+                "error",
+                {"error": stderr_text or f"claude exited with code {proc.returncode}"},
+            )
+            job_manager.mark_failed(
+                job.job_id, stderr_text or f"claude exited with code {proc.returncode}"
+            )
+            return
+
+        # Persist session_id only after a clean run. Failed runs leave
+        # the previous session_id intact so a retry can still resume.
+        if captured_session_id and conversation_id:
+            with _session_map_lock:
+                _session_map[conversation_id] = captured_session_id
+
+        log.info(
+            "chat_stream.done",
+            job_id=job.job_id,
+            conversation_id=conversation_id,
+            session_id=captured_session_id,
+        )
+        yield _sse_event(
+            "done",
+            {"sessionId": captured_session_id} if captured_session_id else {},
+        )
+        job_manager.mark_done(job.job_id, {"session_id": captured_session_id})
+
+    return StreamingResponse(stream_claude(), media_type="text/event-stream")
