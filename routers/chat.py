@@ -16,6 +16,16 @@ log = structlog.get_logger()
 router = APIRouter()
 
 
+# Default polling cadence echoed in the kickoff event. Mirrors the platform's
+# async-webhook defaults (src/schemas/tool.schema.ts: pollEverySeconds=5,
+# pollMaxSeconds=900) so bridge and async-webhook flows present identical
+# polling expectations to the trace drawer + frontend reconnect logic.
+# Tuneable per-call later via request body if a use case demands it; for
+# v1 these constants are enough.
+DEFAULT_POLL_EVERY_SECONDS = 5
+DEFAULT_POLL_MAX_SECONDS = 900
+
+
 # Maps platform conversation_id -> Claude Code session_id so subsequent
 # messages on the same conversation continue the same Claude Code session
 # (--resume <id>). In-memory; lost on uvicorn restart. v2: persist to disk
@@ -160,17 +170,27 @@ def chat_stream(req: ChatStreamRequest):
 
     def stream_claude():
         # Kickoff event MUST be the first thing emitted so the platform
-        # bridge dispatcher can capture the cancel URL before any text
-        # flows. We send a relative URL — the platform already knows the
-        # coder host from agent.llmConfig.coderUrl / app.coderUrl, so
-        # baking the absolute URL here would just couple another_coder
-        # to its public-facing host. Field name `cancelUrl` (camelCase)
-        # matches the async-webhook contract the platform already speaks.
+        # bridge dispatcher can capture the cancel URL + polling primitives
+        # before any text flows. We send relative URLs — the platform
+        # already knows the coder host from agent.llmConfig.coderUrl /
+        # app.coderUrl, so baking the absolute URL here would just couple
+        # another_coder to its public-facing host. Field names (camelCase)
+        # match the async-webhook contract the platform already speaks.
+        #
+        # statusUrl + poll seconds are the polling primitives — when the
+        # platform's frontend SSE drops mid-stream (e.g. mobile lock), the
+        # platform exposes a /conversations/<id>/bridge-status endpoint
+        # that proxies to this jobs/<id>/chat/status URL, returning
+        # accumulatedText so the frontend can resume showing progress in
+        # the existing chat bubble without waiting for graph completion.
         yield _sse_event(
             "kickoff",
             {
                 "jobId": job.job_id,
                 "cancelUrl": f"/jobs/{job.job_id}/cancel",
+                "statusUrl": f"/jobs/{job.job_id}/chat/status",
+                "pollEverySeconds": DEFAULT_POLL_EVERY_SECONDS,
+                "pollMaxSeconds": DEFAULT_POLL_MAX_SECONDS,
             },
         )
 
@@ -250,6 +270,14 @@ def chat_stream(req: ChatStreamRequest):
 
                 text = _extract_text_chunk(event)
                 if text:
+                    # Mirror the SSE chunk into the job's accumulated_text
+                    # buffer so polling clients (mobile reconnect path) see
+                    # the same content that streaming clients see, in the
+                    # same order. Append happens BEFORE yield so a poll
+                    # racing with a chunk can never see a chunk that the
+                    # streaming client has already received but the buffer
+                    # hasn't recorded yet.
+                    job_manager.append_text(job.job_id, text)
                     yield _sse_event("text", {"chunk": text})
 
             proc.wait()

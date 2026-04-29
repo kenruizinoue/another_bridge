@@ -42,6 +42,13 @@ class Job:
     # Reset to None once the process exits so JobManager.cancel on a
     # finished job is a clean no-op.
     process: subprocess.Popen | None = field(default=None, repr=False)
+    # Live-accumulating text buffer for streaming chat jobs (kind="chat_stream").
+    # Each text chunk extracted from Claude Code's stream-json output is
+    # appended here so that GET /jobs/<id>/chat/status can return a snapshot
+    # of "what's been generated so far" — used by the platform's polling
+    # reconnect path when a mobile client's SSE drops mid-stream. Empty for
+    # non-chat jobs (planning/implementation use job.result instead).
+    accumulated_text: str = ""
 
     def elapsed_seconds(self) -> float:
         end = self.finished_at if self.finished_at is not None else time.time()
@@ -106,6 +113,40 @@ class JobManager:
         with self._lock:
             job = self._jobs.get(job_id)
             return bool(job and job.cancelled)
+
+    def append_text(self, job_id: str, chunk: str) -> None:
+        """Append a streamed text chunk to the job's accumulated_text buffer.
+        Thread-safe — chat_stream runs the SSE generator in a request worker
+        thread while polling clients hit the status endpoint from other
+        worker threads. No-op for unknown job_ids (graceful for races where
+        a poll arrives just after the job was reaped). Empty chunks are
+        skipped to avoid pointless lock churn."""
+        if not chunk:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.accumulated_text += chunk
+
+    def get_chat_status(self, job_id: str) -> dict[str, Any] | None:
+        """Snapshot of a chat_stream job's progress for the polling reconnect
+        path. Returns None for unknown job_ids so the caller can 404 cleanly.
+        accumulated_text is whatever has been streamed so far — empty string
+        is valid (job spawned, hasn't yet emitted any assistant text). The
+        ``done`` boolean is the polling client's terminator: when True, the
+        platform will switch from polling to fetching the saved final
+        message via the normal /messages?since= path."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            return {
+                "jobId": job.job_id,
+                "status": job.status,
+                "accumulatedText": job.accumulated_text,
+                "elapsedSeconds": job.elapsed_seconds(),
+                "done": job.status != "running",
+            }
 
     def cancel(self, job_id: str) -> bool:
         """Mark the job cancelled and signal its subprocess to terminate.
