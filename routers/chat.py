@@ -1,6 +1,5 @@
 import json
 import os
-import threading
 from typing import Optional
 
 import structlog
@@ -11,6 +10,7 @@ from pydantic import BaseModel, Field
 from config import CLAUDE_MODEL
 from jobs import job_manager
 from services import claude_runner
+from services.session_store import session_store
 
 log = structlog.get_logger()
 router = APIRouter()
@@ -26,12 +26,13 @@ DEFAULT_POLL_EVERY_SECONDS = 5
 DEFAULT_POLL_MAX_SECONDS = 900
 
 
-# Maps platform conversation_id -> Claude Code session_id so subsequent
-# messages on the same conversation continue the same Claude Code session
-# (--resume <id>). In-memory; lost on uvicorn restart. v2: persist to disk
-# or sqlite so a coder restart doesn't drop in-flight conversations.
-_session_map: dict[str, str] = {}
-_session_map_lock = threading.Lock()
+# Conversation_id → Claude Code session_id is now persisted via
+# services/session_store (SQLite). The previous in-memory dict was lost
+# on every uvicorn restart, so a mid-day deploy silently dropped every
+# active conversation back to a fresh Claude Code session. The store
+# call sites below are unchanged in shape — get_session before spawn,
+# set_session after a clean run — so the lookup-cost is microseconds
+# (one SQLite SELECT) and the persistence is free.
 
 
 class ChatStreamRequest(BaseModel):
@@ -163,8 +164,7 @@ def chat_stream(req: ChatStreamRequest):
     # Resolve previous session for this conversation if any
     prev_session_id: Optional[str] = None
     if conversation_id:
-        with _session_map_lock:
-            prev_session_id = _session_map.get(conversation_id)
+        prev_session_id = session_store.get_session(conversation_id)
 
     job = job_manager.create("chat_stream")
 
@@ -305,8 +305,7 @@ def chat_stream(req: ChatStreamRequest):
         # Persist session_id only after a clean run. Failed runs leave
         # the previous session_id intact so a retry can still resume.
         if captured_session_id and conversation_id:
-            with _session_map_lock:
-                _session_map[conversation_id] = captured_session_id
+            session_store.set_session(conversation_id, captured_session_id)
 
         log.info(
             "chat_stream.done",

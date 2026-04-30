@@ -49,11 +49,10 @@ def _clean_jobs():
         job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
 
 
-@pytest.fixture(autouse=True)
-def _clean_session_map():
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
-    yield
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
+# Session-map cleanup moved to tests/conftest.py — the conversation_id
+# → session_id store is now SQLite-backed and shared across the suite,
+# so wiping it once per test there avoids redefining the autouse fixture
+# in every chat-related test file.
 
 
 # ──────────────────────────────────────────────────────────────────────

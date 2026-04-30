@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient
 from jobs import job_manager
 from routers import chat as chat_router
 from services import claude_runner
+from services.session_store import session_store
 
 
 @pytest.fixture
@@ -53,11 +54,8 @@ def _clean_jobs():
         job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
 
 
-@pytest.fixture(autouse=True)
-def _clean_session_map():
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
-    yield
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
+# Session-store cleanup moved to tests/conftest.py — see the comment
+# in test_chat_polling.py for context.
 
 
 def _consume(resp: Any) -> str:
@@ -290,7 +288,7 @@ class TestMidStreamCancel:
         # Cancelled run must NOT persist session_id even though one was
         # captured — same rule as a non-zero exit. A retry should start
         # fresh.
-        assert "conv-cancel" not in chat_router._session_map
+        assert session_store.get_session("conv-cancel") is None
 
         job_id = created[0]
         snapshot = job_manager.get_chat_status(job_id)
@@ -356,7 +354,7 @@ class TestNonJsonTolerance:
 
         # And the captured session_id from the valid system init was still
         # persisted — garbage didn't poison the success path.
-        assert chat_router._session_map.get("conv-noisy") == "sess-noisy"
+        assert session_store.get_session("conv-noisy") == "sess-noisy"
 
 
 # ──────────────────────────────────────────────────────────────────────

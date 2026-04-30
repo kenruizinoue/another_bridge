@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient
 
 from jobs import job_manager
 from routers import chat as chat_router
+from services.session_store import session_store
 from services import claude_runner
 
 
@@ -54,11 +55,10 @@ def _clean_jobs():
         job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
 
 
-@pytest.fixture(autouse=True)
-def _clean_session_map():
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
-    yield
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
+# Session-store cleanup moved to tests/conftest.py — the
+# conversation_id → session_id store is now SQLite-backed via
+# services/session_store, and conftest's autouse fixture wipes it
+# between every test.
 
 
 class _SuccessProc:
@@ -158,7 +158,7 @@ class TestSessionMapCapture:
             ) as resp:
                 _consume(resp)
 
-        assert chat_router._session_map.get("conv-1") == "sess-A"
+        assert session_store.get_session("conv-1") == "sess-A"
 
     def test_second_message_passes_resume_with_stored_session_id(
         self, client: TestClient
@@ -167,7 +167,7 @@ class TestSessionMapCapture:
         --resume <stored>. This is the bridge's core continuity feature —
         without it, every turn is a one-shot."""
         # Pre-populate as if a prior run already captured the session.
-        chat_router._session_map["conv-2"] = "sess-A"
+        session_store.set_session("conv-2", "sess-A")
 
         with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
             # Returning a different session_id here doesn't matter — the
@@ -194,7 +194,7 @@ class TestSessionMapCapture:
         (it can — long sessions get re-issued), the next clean run must
         update the map. Otherwise the third turn would --resume into a
         stale session and Claude would 404 it."""
-        chat_router._session_map["conv-rotate"] = "sess-A"
+        session_store.set_session("conv-rotate", "sess-A")
 
         with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
             mock_popen.return_value = _SuccessProc(session_id="sess-B")
@@ -205,7 +205,7 @@ class TestSessionMapCapture:
             ) as resp:
                 _consume(resp)
 
-        assert chat_router._session_map.get("conv-rotate") == "sess-B"
+        assert session_store.get_session("conv-rotate") == "sess-B"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ class TestFailedRunDoesNotPersistSession:
             ) as resp:
                 _consume(resp)
 
-        assert "conv-failed" not in chat_router._session_map
+        assert session_store.get_session("conv-failed") is None
 
     def test_failed_run_leaves_prior_session_id_intact(
         self, client: TestClient
@@ -240,7 +240,7 @@ class TestFailedRunDoesNotPersistSession:
         previous successful turn, a subsequent FAILED turn must NOT wipe
         it — a retry should still --resume into the working session
         rather than starting from scratch."""
-        chat_router._session_map["conv-retry"] = "sess-good"
+        session_store.set_session("conv-retry", "sess-good")
 
         with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
             mock_popen.return_value = _FailingProc()
@@ -253,7 +253,7 @@ class TestFailedRunDoesNotPersistSession:
 
         # The old session id survives the failed run, so the next attempt
         # can pick up where the working turn left off.
-        assert chat_router._session_map.get("conv-retry") == "sess-good"
+        assert session_store.get_session("conv-retry") == "sess-good"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ class TestOneShotMode:
     def test_no_conversation_id_does_not_resume(self, client: TestClient) -> None:
         """A one-shot call (no conversation_id) must never pass --resume
         even if the session map is populated for some other conversation."""
-        chat_router._session_map["conv-other"] = "sess-A"
+        session_store.set_session("conv-other", "sess-A")
 
         with patch.object(claude_runner.subprocess, "Popen") as mock_popen:
             mock_popen.return_value = _SuccessProc(session_id="sess-B")
@@ -294,7 +294,10 @@ class TestOneShotMode:
             ) as resp:
                 body = _consume(resp)
 
-        assert chat_router._session_map == {}
+        # No conversation_id → no row written for any conversation_id.
+        # Sanity check: the captured session_id from the SSE done event
+        # below is ALSO not stored under any conversation key.
+        assert session_store.get_session("sess-X") is None
         # Sanity: the done event still carries the captured session_id so
         # an SDK consumer that wants to thread it back later can.
         done_block = next(

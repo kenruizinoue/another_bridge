@@ -49,14 +49,8 @@ def _clean_jobs():
         job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
 
 
-@pytest.fixture(autouse=True)
-def _clean_session_map():
-    """Same hygiene for the conversation_id → session_id map. Without
-    this, a successful test that captures a session_id would let the
-    next test's --resume see a stale id and skip the system-init path."""
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
-    yield
-    chat_router._session_map.clear()  # type: ignore[attr-defined]
+# Session-map cleanup moved to tests/conftest.py — see the comment in
+# test_chat_polling.py for context.
 
 
 class _StubProc:
