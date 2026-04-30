@@ -4,9 +4,11 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Request
+from pydantic import ValidationError
 
 from config import CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
+from routers._schemas import PlanningRequest, first_error_message
 from routers.repos import validate_repo_path
 from services import claude_runner
 from services.repo_context import build_selected_repo_context
@@ -311,38 +313,24 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
         body = {}
 
     args = extract_args(body)
-    ticket_number_raw = args.get("ticket_number")
-    ticket_body = args.get("ticket_body")
-    repo_path = args.get("repo_path")
-
     log.info(
         "instruct_planning.request",
-        ticket_number=ticket_number_raw,
-        ticket_body_len=len(ticket_body) if isinstance(ticket_body, str) else None,
-        repo_path=repo_path,
+        ticket_number=args.get("ticket_number"),
+        ticket_body_len=len(args["ticket_body"]) if isinstance(args.get("ticket_body"), str) else None,
+        repo_path=args.get("repo_path"),
     )
 
+    # PlanningRequest enforces ticket_number int-coercion, non-empty
+    # ticket_body, and max-length caps. Validation errors come back with
+    # the LLM-recovery hints intact so the Planner Agent can self-
+    # correct on its next pass — see routers/_schemas.py for why this
+    # path returns 200 + {error: string} rather than FastAPI's 422.
     try:
-        ticket_number = int(ticket_number_raw)
-    except (TypeError, ValueError):
-        return {"error": "ticket_number is required and must be an integer"}
+        req = PlanningRequest.model_validate(args)
+    except ValidationError as e:
+        return {"error": first_error_message(e)}
 
-    if not isinstance(ticket_body, str) or not ticket_body.strip():
-        # Hint the recovery path so the LLM (Planner Agent) can self-correct
-        # on its next pass without needing a prompt change. If the upstream
-        # github_get_issue returned an empty body, the agent should
-        # synthesize ticket_body from the issue title + the user's chat
-        # context, not bail.
-        return {
-            "error": (
-                "ticket_body is required and must be a non-empty string. "
-                "If the GitHub issue body is empty, build ticket_body from "
-                "the issue title plus the user's description in the chat "
-                "(do not pass empty)."
-            )
-        }
-
-    resolved_repo_path = repo_path or CODING_REPO_PATH
+    resolved_repo_path = req.repo_path or CODING_REPO_PATH
     if not resolved_repo_path:
         return {"error": "repo_path not provided and CODING_REPO_PATH not configured"}
     resolved_repo_path, err = validate_repo_path(resolved_repo_path)
@@ -353,12 +341,12 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
     background_tasks.add_task(
         _run_planning_job,
         job.job_id,
-        ticket_number,
-        ticket_body,
+        req.ticket_number,
+        req.ticket_body,
         resolved_repo_path,
     )
 
-    log.info("instruct_planning.dispatched", job_id=job.job_id, ticket_number=ticket_number)
+    log.info("instruct_planning.dispatched", job_id=job.job_id, ticket_number=req.ticket_number)
     return {
         "job_id": job.job_id,
         "kind": "instruct_planning",

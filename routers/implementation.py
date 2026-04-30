@@ -5,9 +5,11 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, Request
+from pydantic import ValidationError
 
 from config import CLAUDE_MODEL, CODING_REPO_PATH, GITHUB_DEFAULT_REPO, GITHUB_PAT
 from jobs import job_manager
+from routers._schemas import ImplementationRequest, first_error_message
 from routers.repos import validate_repo_path
 from services import claude_runner, github_service
 from services.git_service import (
@@ -408,48 +410,26 @@ async def instruct_implementation(request: Request, background_tasks: Background
         body = {}
 
     args = extract_args(body)
-    ticket_number_raw = args.get("ticket_number")
-    ticket_body = args.get("ticket_body")
-    plan = args.get("plan")
-    repo_path = args.get("repo_path")
-    # Optional explicit override — when omitted, _resolve_base_branch
-    # auto-detects the remote's default branch via ls-remote --symref.
-    base_branch_override_raw = args.get("base_branch")
-    base_branch_override = (
-        base_branch_override_raw.strip()
-        if isinstance(base_branch_override_raw, str) and base_branch_override_raw.strip()
-        else None
-    )
-
     log.info(
         "instruct_implementation.request",
-        ticket_number=ticket_number_raw,
-        ticket_body_len=len(ticket_body) if isinstance(ticket_body, str) else None,
-        plan_len=len(plan) if isinstance(plan, str) else None,
-        repo_path=repo_path,
-        base_branch_override=base_branch_override,
+        ticket_number=args.get("ticket_number"),
+        ticket_body_len=len(args["ticket_body"]) if isinstance(args.get("ticket_body"), str) else None,
+        plan_len=len(args["plan"]) if isinstance(args.get("plan"), str) else None,
+        repo_path=args.get("repo_path"),
+        base_branch_override=args.get("base_branch"),
     )
 
+    # ImplementationRequest enforces ticket_number/body/plan and caps
+    # all string fields. Empty/whitespace base_branch is normalized to
+    # None inside the schema so the auto-detection path runs. See
+    # routers/_schemas.py for why this returns 200 + {error: string}
+    # rather than FastAPI's default 422.
     try:
-        ticket_number = int(ticket_number_raw)
-    except (TypeError, ValueError):
-        return {"error": "ticket_number is required and must be an integer"}
+        req = ImplementationRequest.model_validate(args)
+    except ValidationError as e:
+        return {"error": first_error_message(e)}
 
-    if not isinstance(ticket_body, str) or not ticket_body.strip():
-        # See planning.py — same recovery hint so the agent self-corrects.
-        return {
-            "error": (
-                "ticket_body is required and must be a non-empty string. "
-                "If the GitHub issue body is empty, build ticket_body from "
-                "the issue title plus the user's description in the chat "
-                "(do not pass empty)."
-            )
-        }
-
-    if not isinstance(plan, str) or not plan.strip():
-        return {"error": "plan is required and must be a non-empty string"}
-
-    resolved_repo_path = repo_path or CODING_REPO_PATH
+    resolved_repo_path = req.repo_path or CODING_REPO_PATH
     if not resolved_repo_path:
         return {"error": "repo_path not provided and CODING_REPO_PATH not configured"}
     resolved_repo_path, err = validate_repo_path(resolved_repo_path)
@@ -460,11 +440,11 @@ async def instruct_implementation(request: Request, background_tasks: Background
     background_tasks.add_task(
         _run_implementation_job,
         job.job_id,
-        ticket_number,
-        ticket_body,
-        plan,
+        req.ticket_number,
+        req.ticket_body,
+        req.plan,
         resolved_repo_path,
-        base_branch_override,
+        req.base_branch,
     )
 
     log.info("instruct_implementation.dispatched", job_id=job.job_id, ticket_number=ticket_number)
