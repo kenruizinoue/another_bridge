@@ -22,3 +22,11 @@ CLAUDE_MODEL = "claude-opus-4-7"
 ANOTHER_LOGIC_API_KEY = os.environ.get("ANOTHER_LOGIC_API_KEY", "")
 ANOTHER_LOGIC_BASE_URL = os.environ.get("ANOTHER_LOGIC_BASE_URL", "http://localhost:3000")
 ASK_PROFILE_ID = "69bee9d1f38c71f60bd3ce10"
+
+# Shared secret callers must send as the `X-Coder-Key` header on /chat/stream,
+# /tools/*, and /jobs/*. The same value is configured on the AnotherAgent
+# side as `agent.llmConfig.coderApiKey`. Generate with:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Empty value is treated as a misconfiguration and returns 503 — see
+# auth.verify_api_key for the rationale.
+ANOTHER_CODER_API_KEY = os.environ.get("ANOTHER_CODER_API_KEY", "")

@@ -49,9 +49,18 @@ GITHUB_PAT=github_pat_xxxxxxxxxxxx
 GITHUB_DEFAULT_REPO=your-org/your-repo
 CODING_REPO_PATH=/absolute/path/to/your/local/clone
 BASE_BRANCH=dev
+ANOTHER_CODER_API_KEY=<paste output of the command below>
 ```
 
 `BASE_BRANCH` is what agent PRs target. Defaults to `dev`. Change to `main` if your repo doesn't use a dev branch.
+
+`ANOTHER_CODER_API_KEY` is a shared secret callers must send as `X-Coder-Key`. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+The same value goes into your AnotherAgent agent's **API secret** field (Agent detail → Claude Code → API secret). `/health` stays unauthed for uptime checks; everything else (`/chat/stream`, `/tools/*`, `/jobs/*`) requires the header.
 
 ### 3. Run the server
 
