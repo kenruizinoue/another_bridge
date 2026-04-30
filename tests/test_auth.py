@@ -56,3 +56,30 @@ def test_unset_env_returns_503(client: TestClient, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("ANOTHER_CODER_API_KEY", "")
     resp = client.get("/protected", headers={"X-Coder-Key": "anything"})
     assert resp.status_code == 503
+
+
+# /auth/verify is wired in main.py with the auth dep; mounting the
+# router directly here exercises the actual route handler too. Distinct
+# from the dep tests above because a regression could land in the route
+# (e.g. someone removes the dep) without breaking the dep's own tests.
+
+@pytest.fixture
+def verify_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    from fastapi import Depends, FastAPI
+    from routers import auth as auth_router
+
+    monkeypatch.setenv("ANOTHER_CODER_API_KEY", "expected-secret")
+    app = FastAPI()
+    app.include_router(auth_router.router, dependencies=[Depends(verify_api_key)])
+    return TestClient(app)
+
+
+def test_verify_route_passes_with_correct_key(verify_client: TestClient) -> None:
+    resp = verify_client.get("/auth/verify", headers={"X-Coder-Key": "expected-secret"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+def test_verify_route_rejects_wrong_key(verify_client: TestClient) -> None:
+    resp = verify_client.get("/auth/verify", headers={"X-Coder-Key": "wrong"})
+    assert resp.status_code == 401
