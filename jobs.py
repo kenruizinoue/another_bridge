@@ -253,6 +253,31 @@ class JobManager:
             job.finished_at = time.time()
             job.process = None
 
+    def prune_finished_older_than(self, max_age_seconds: float) -> int:
+        """Drop ``done`` / ``failed`` jobs whose ``finished_at`` is older
+        than the cutoff. Running jobs are never touched — even ones with
+        unrealistically long uptimes — because the cancel/status routes
+        depend on those entries existing for as long as the subprocess
+        is alive. Returns the deleted count for the reaper's log line.
+
+        Called by ``services.reaper.Reaper`` on a timer; without it the
+        in-memory dict grows unbounded over the life of a long-running
+        ``uvicorn`` process and a coder running for weeks accumulates
+        thousands of dead Job entries.
+        """
+        cutoff = time.time() - max_age_seconds
+        with self._lock:
+            stale = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.status != "running"
+                and job.finished_at is not None
+                and job.finished_at < cutoff
+            ]
+            for job_id in stale:
+                del self._jobs[job_id]
+            return len(stale)
+
 
 # Module-level singleton — every router shares the same in-memory store.
 job_manager = JobManager()

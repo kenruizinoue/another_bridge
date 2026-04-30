@@ -7,20 +7,30 @@ from fastapi import Depends, FastAPI
 from auth import verify_api_key
 from config import CLAUDE_MODEL
 from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos
+from services.reaper import build_default_reaper
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
 
 
 # `@app.on_event("startup")` is deprecated in FastAPI ≥ 0.93; the
-# replacement is a lifespan async context manager. Yield separates the
-# startup section from the (currently empty) shutdown section — when we
-# eventually add a TTL reaper / SQLite session-store close, those go
-# below the yield.
+# replacement is a lifespan async context manager. Statements before
+# ``yield`` run on startup; statements after run on shutdown.
+#
+# The reaper is constructed lazily inside the lifespan function (not at
+# module import) so unit tests that only ``import main`` don't spawn a
+# background thread on every test collection. The TestClient(app)
+# fixture used in production-style tests would still trigger startup;
+# none of our tests bind to ``main.app`` for that reason.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     log.info("server.started", model=CLAUDE_MODEL)
-    yield
+    reaper = build_default_reaper()
+    reaper.start()
+    try:
+        yield
+    finally:
+        reaper.stop()
 
 
 app = FastAPI(lifespan=lifespan)
