@@ -1,1 +1,0 @@
-Do not commit anything. You may edit, create, or delete files. Allowed shell commands: npm install, grep, find.

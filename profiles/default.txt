@@ -1,1 +1,0 @@
-Do not commit anything. You may edit, create, or delete files and run shell commands like npm install, grep, and find. After making changes, compile the project to verify there are no errors.

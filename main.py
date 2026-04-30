@@ -4,14 +4,8 @@ import structlog
 from fastapi import Depends, FastAPI
 
 from auth import verify_api_key
-from config import (
-    ANOTHER_LOGIC_API_KEY,
-    ANOTHER_LOGIC_BASE_URL,
-    ASK_PROFILE_ID,
-    CLAUDE_MODEL,
-    TARGET_DIRECTORY,
-)
-from routers import auth as auth_router, chat, github, health, implementation, jobs, legacy, planning, repos
+from config import CLAUDE_MODEL
+from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
@@ -21,21 +15,12 @@ app = FastAPI()
 
 @app.on_event("startup")
 def on_startup():
-    log.info(
-        "server.started",
-        target_directory=TARGET_DIRECTORY,
-        model=CLAUDE_MODEL,
-        ask_profile_id=ASK_PROFILE_ID,
-        base_url=ANOTHER_LOGIC_BASE_URL,
-        another_logic_api_key=ANOTHER_LOGIC_API_KEY,
-    )
+    log.info("server.started", model=CLAUDE_MODEL)
 
 
 # /health stays unauthed — ngrok / uptime checks consume it without
-# needing the bridge secret. Same goes for legacy.router which has its
-# own /verifyApiKey contract used by older flows.
+# needing the bridge secret.
 app.include_router(health.router)
-app.include_router(legacy.router)
 
 # Auth-gated routers. `dependencies=[Depends(verify_api_key)]` runs the
 # header check before any handler in the router fires; missing /
