@@ -135,7 +135,14 @@ class JobManager:
         is valid (job spawned, hasn't yet emitted any assistant text). The
         ``done`` boolean is the polling client's terminator: when True, the
         platform will switch from polling to fetching the saved final
-        message via the normal /messages?since= path."""
+        message via the normal /messages?since= path.
+
+        Deliberately does NOT surface ``elapsed_seconds``: the platform's
+        bridge-status proxy strips that field on the way to the frontend
+        (the polling client measures wall-clock locally), so emitting it
+        here is dead weight over ngrok. The generic ``to_status_response``
+        used by /jobs/<id>/status keeps it because async-webhook callers
+        do read it for trace bookkeeping."""
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -144,7 +151,6 @@ class JobManager:
                 "jobId": job.job_id,
                 "status": job.status,
                 "accumulatedText": job.accumulated_text,
-                "elapsedSeconds": job.elapsed_seconds(),
                 "done": job.status != "running",
             }
 

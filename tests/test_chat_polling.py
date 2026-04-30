@@ -134,7 +134,11 @@ class TestChatStatusEndpoint:
         assert body["status"] == "running"
         assert body["accumulatedText"] == "partial response so far"
         assert body["done"] is False
-        assert "elapsedSeconds" in body
+        # `elapsedSeconds` deliberately NOT surfaced on the chat-status
+        # endpoint — the platform proxy strips it and the polling client
+        # uses wall-clock locally. Lock the contract here so a future
+        # revert that re-adds it bloats the proxy hop without value.
+        assert "elapsedSeconds" not in body
 
 
 # ──────────────────────────────────────────────────────────────────────

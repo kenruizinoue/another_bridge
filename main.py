@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import Depends, FastAPI
@@ -10,12 +11,19 @@ from routers import auth as auth_router, chat, github, health, implementation, j
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 log = structlog.get_logger()
 
-app = FastAPI()
 
-
-@app.on_event("startup")
-def on_startup():
+# `@app.on_event("startup")` is deprecated in FastAPI ≥ 0.93; the
+# replacement is a lifespan async context manager. Yield separates the
+# startup section from the (currently empty) shutdown section — when we
+# eventually add a TTL reaper / SQLite session-store close, those go
+# below the yield.
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     log.info("server.started", model=CLAUDE_MODEL)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # /health stays unauthed — ngrok / uptime checks consume it without
