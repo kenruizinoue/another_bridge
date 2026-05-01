@@ -32,6 +32,13 @@ class Job:
     finished_at: float | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    # Structured failure classification — see services/errors.py for the
+    # current set (spawn_failed, timeout, cancelled, claude_failed,
+    # git_push_failed, pr_create_failed). None when the job is still
+    # running or completed cleanly. Forward-compatible with future
+    # platform-side UI that wants to render different treatments per
+    # kind; today the platform just relays ``error`` verbatim.
+    error_kind: str | None = None
     # When True, an external cancel request fired. The runner that owns
     # this job should detect it after subprocess exit and mark_failed
     # with the cancel marker instead of mark_done with a (now stale)
@@ -65,6 +72,11 @@ class Job:
             body["result"] = self.result
         if self.status == "failed" and self.error is not None:
             body["error"] = self.error
+        if self.status == "failed" and self.error_kind is not None:
+            # Forward-compatible — surface the structured failure kind
+            # when the runner classified its error. Platform consumers
+            # can branch on it; older consumers ignore the field.
+            body["error_kind"] = self.error_kind
         return body
 
 
@@ -241,15 +253,31 @@ class JobManager:
             job.finished_at = time.time()
             job.process = None
 
-    def mark_failed(self, job_id: str, error: str) -> None:
+    def mark_failed(
+        self,
+        job_id: str,
+        error: str,
+        *,
+        kind: str | None = None,
+    ) -> None:
+        """Record a failure with optional structured kind (see
+        services/errors.py for valid values). When ``cancelled`` was
+        flipped externally, the cancel reason wins regardless of what
+        the caller passed — the user already gave up on this run, the
+        underlying error is downstream noise."""
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return
             job.status = "failed"
-            # Surface the cancel reason explicitly; otherwise use the
-            # caller-supplied error verbatim.
-            job.error = "cancelled by client" if job.cancelled else error
+            if job.cancelled:
+                # External cancel takes precedence — runner-side
+                # error becomes irrelevant once the user aborted.
+                job.error = "cancelled by client"
+                job.error_kind = "cancelled"
+            else:
+                job.error = error
+                job.error_kind = kind
             job.finished_at = time.time()
             job.process = None
 

@@ -12,6 +12,14 @@ from jobs import job_manager
 from routers._schemas import ImplementationRequest, first_error_message
 from routers.repos import validate_repo_path
 from services import claude_runner, github_service
+from services.errors import (
+    CANCELLED,
+    CLAUDE_FAILED,
+    GIT_PUSH_FAILED,
+    PR_CREATE_FAILED,
+    SPAWN_FAILED,
+    TIMEOUT,
+)
 from services.git_service import (
     _branch_exists_locally,
     _branch_exists_on_remote,
@@ -140,15 +148,20 @@ def _run_implementation_job(
     plan: str,
     resolved_repo_path: str,
     base_branch_override: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> None:
     """All git + Claude + push + PR work runs here in a BackgroundTask. Updates
     job_manager throughout so the platform poller sees real-time status."""
     started = time.time()
     branch_name = f"agent/ticket-{ticket_number}"
 
-    def fail(msg: str, **extra: Any) -> None:
+    def fail(msg: str, *, kind: str | None = None, **extra: Any) -> None:
+        """Log + mark_failed with optional structured kind. Generic
+        git failures (status, branch resolution, dirty tree) leave
+        kind=None — they're operator/agent issues that don't map to
+        the canonical Claude/push/PR failure modes."""
         log.error("instruct_implementation.failed", job_id=job_id, error=msg, **extra)
-        job_manager.mark_failed(job_id, msg)
+        job_manager.mark_failed(job_id, msg, kind=kind)
 
     git_dir_check = _run_git(["rev-parse", "--git-dir"], resolved_repo_path)
     if git_dir_check.returncode != 0:
@@ -221,19 +234,30 @@ def _run_implementation_job(
         branch_name=branch_name,
     )
 
+    effective_timeout = timeout_seconds or IMPLEMENTATION_TIMEOUT_SECONDS
     result = claude_runner.run_blocking(
         args=claude_runner.build_claude_args(prompt=implement_prompt, model=CLAUDE_MODEL),
         cwd=resolved_repo_path,
-        timeout_seconds=IMPLEMENTATION_TIMEOUT_SECONDS,
+        timeout_seconds=effective_timeout,
         job_id=job_id,
     )
 
     if result.spawn_error:
-        fail(result.spawn_error, branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
+        fail(
+            result.spawn_error,
+            kind=SPAWN_FAILED,
+            branch_name=branch_name,
+            duration_seconds=round(time.time() - started, 2),
+        )
         return
 
     if result.timed_out:
-        fail("claude timed out", branch_name=branch_name, duration_seconds=round(time.time() - started, 2))
+        fail(
+            "claude timed out",
+            kind=TIMEOUT,
+            branch_name=branch_name,
+            duration_seconds=round(time.time() - started, 2),
+        )
         return
 
     # Cancel arrived during the run → reflect it in job status. Any
@@ -241,13 +265,14 @@ def _run_implementation_job(
     # NOT cleaned up here; that's a follow-up if it becomes a problem.
     if result.cancelled:
         log.info("instruct_implementation.cancelled", job_id=job_id, ticket_number=ticket_number, branch_name=branch_name)
-        job_manager.mark_failed(job_id, "cancelled by client")
+        job_manager.mark_failed(job_id, "cancelled by client", kind=CANCELLED)
         return
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
         fail(
             stderr or f"claude exited with code {result.returncode}",
+            kind=CLAUDE_FAILED,
             exit_code=result.returncode,
             branch_name=branch_name,
         )
@@ -288,7 +313,11 @@ def _run_implementation_job(
         timeout=PUSH_TIMEOUT_SECONDS,
     )
     if push_result.returncode != 0:
-        fail(f"git push failed: {push_result.stderr.strip()}", branch_name=branch_name)
+        fail(
+            f"git push failed: {push_result.stderr.strip()}",
+            kind=GIT_PUSH_FAILED,
+            branch_name=branch_name,
+        )
         return
 
     log.info("instruct_implementation.pushed", job_id=job_id, branch_name=branch_name)
@@ -344,6 +373,7 @@ def _run_implementation_job(
                 base_branch,
                 resolved_repo_path,
             ),
+            kind=PR_CREATE_FAILED,
             branch_name=branch_name,
             commits=commits,
             files_changed=files_changed,
@@ -445,6 +475,7 @@ async def instruct_implementation(request: Request, background_tasks: Background
         req.plan,
         resolved_repo_path,
         req.base_branch,
+        req.timeout_seconds,
     )
 
     log.info("instruct_implementation.dispatched", job_id=job.job_id, ticket_number=ticket_number)

@@ -11,6 +11,7 @@ from jobs import job_manager
 from routers._schemas import PlanningRequest, first_error_message
 from routers.repos import validate_repo_path
 from services import claude_runner
+from services.errors import CANCELLED, CLAUDE_FAILED, SPAWN_FAILED, TIMEOUT
 from services.repo_context import build_selected_repo_context
 from services.request import extract_args
 
@@ -174,10 +175,17 @@ def _run_planning_job(
     ticket_number: int,
     ticket_body: str,
     resolved_repo_path: str,
+    timeout_seconds: int | None = None,
 ) -> None:
     """Runs the actual Claude planning subprocess. Called in a BackgroundTask
-    so the HTTP response returns immediately with the job_id."""
+    so the HTTP response returns immediately with the job_id.
+
+    ``timeout_seconds`` is the optional per-request override from the
+    request schema; when None, falls back to PLANNING_TIMEOUT_SECONDS.
+    The schema already caps the override at 1800s, so no extra clamp
+    needed here."""
     workspace_dir = os.path.dirname(resolved_repo_path.rstrip("/"))
+    effective_timeout = timeout_seconds or PLANNING_TIMEOUT_SECONDS
     prompt = _build_planning_prompt(
         ticket_number=ticket_number,
         ticket_body=ticket_body,
@@ -192,18 +200,19 @@ def _run_planning_job(
         model=CLAUDE_MODEL,
         repo_path=resolved_repo_path,
         workspace_dir=workspace_dir,
+        timeout_seconds=effective_timeout,
     )
 
     result = claude_runner.run_blocking(
         args=claude_runner.build_claude_args(prompt=prompt, model=CLAUDE_MODEL),
         cwd=resolved_repo_path,
-        timeout_seconds=PLANNING_TIMEOUT_SECONDS,
+        timeout_seconds=effective_timeout,
         job_id=job_id,
     )
 
     if result.spawn_error:
         log.error("instruct_planning.spawn_failed", job_id=job_id, err=result.spawn_error)
-        job_manager.mark_failed(job_id, result.spawn_error)
+        job_manager.mark_failed(job_id, result.spawn_error, kind=SPAWN_FAILED)
         return
 
     duration = result.duration_seconds
@@ -215,7 +224,7 @@ def _run_planning_job(
             ticket_number=ticket_number,
             duration_seconds=duration,
         )
-        job_manager.mark_failed(job_id, f"timeout after {duration}s")
+        job_manager.mark_failed(job_id, f"timeout after {duration}s", kind=TIMEOUT)
         return
 
     # Cancel arrived during the run → SIGTERM/SIGKILL killed Claude;
@@ -227,7 +236,7 @@ def _run_planning_job(
             ticket_number=ticket_number,
             duration_seconds=duration,
         )
-        job_manager.mark_failed(job_id, "cancelled by client")
+        job_manager.mark_failed(job_id, "cancelled by client", kind=CANCELLED)
         return
 
     if result.returncode != 0:
@@ -240,7 +249,11 @@ def _run_planning_job(
             stderr=stderr_text,
             duration_seconds=duration,
         )
-        job_manager.mark_failed(job_id, stderr_text or f"claude exited with code {result.returncode}")
+        job_manager.mark_failed(
+            job_id,
+            stderr_text or f"claude exited with code {result.returncode}",
+            kind=CLAUDE_FAILED,
+        )
         return
 
     raw_output = result.stdout.strip()
@@ -344,6 +357,7 @@ async def instruct_planning(request: Request, background_tasks: BackgroundTasks)
         req.ticket_number,
         req.ticket_body,
         resolved_repo_path,
+        req.timeout_seconds,
     )
 
     log.info("instruct_planning.dispatched", job_id=job.job_id, ticket_number=req.ticket_number)

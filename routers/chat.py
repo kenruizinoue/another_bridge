@@ -11,6 +11,7 @@ from config import CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
 from routers.repos import validate_repo_path
 from services import claude_runner
+from services.errors import CANCELLED, CLAUDE_FAILED, SPAWN_FAILED
 from services.session_store import session_store
 
 log = structlog.get_logger()
@@ -301,7 +302,7 @@ def chat_stream(req: ChatStreamRequest):
         except FileNotFoundError as err:
             log.error("chat_stream.spawn_failed", job_id=job.job_id, err=str(err))
             yield _sse_event("error", {"error": f"failed to spawn claude: {err}"})
-            job_manager.mark_failed(job.job_id, f"spawn failed: {err}")
+            job_manager.mark_failed(job.job_id, f"spawn failed: {err}", kind=SPAWN_FAILED)
             return
 
         # Cancel arrived during the run -> SIGTERM/SIGKILL killed Claude;
@@ -315,7 +316,7 @@ def chat_stream(req: ChatStreamRequest):
                 conversation_id=conversation_id,
             )
             yield _sse_event("error", {"error": "cancelled by client"})
-            job_manager.mark_failed(job.job_id, "cancelled by client")
+            job_manager.mark_failed(job.job_id, "cancelled by client", kind=CANCELLED)
             return
 
         if returncode != 0:
@@ -331,7 +332,9 @@ def chat_stream(req: ChatStreamRequest):
                 {"error": stderr_text or f"claude exited with code {returncode}"},
             )
             job_manager.mark_failed(
-                job.job_id, stderr_text or f"claude exited with code {returncode}"
+                job.job_id,
+                stderr_text or f"claude exited with code {returncode}",
+                kind=CLAUDE_FAILED,
             )
             return
 
