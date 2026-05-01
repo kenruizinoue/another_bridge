@@ -169,7 +169,9 @@ For the bridge: open a chat with any `claude_code`-engine agent and just chat. C
 
 Auth is checked before any handler runs (router-level FastAPI `Depends(verify_api_key)`). Rate limiting uses `slowapi`, keyed on the `X-Coder-Key` header (with remote-IP fallback). CORS is intentionally **not** wired — this is a server-to-server bridge, not a browser-facing API.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for sequence diagrams of the bridge SSE flow, the webhook polling flow, and the security model. See [`docs/CURL_EXAMPLES.md`](docs/CURL_EXAMPLES.md) for raw cURL probes.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — sequence diagrams of the bridge SSE flow, the webhook polling flow, the TTL reaper, the persistence layout.
+- [`SECURITY.md`](SECURITY.md) — threat model, recommended deployment posture, key-rotation procedure. Read this before exposing the bridge over ngrok.
+- [`docs/CURL_EXAMPLES.md`](docs/CURL_EXAMPLES.md) — raw cURL probes for every route.
 
 ---
 
