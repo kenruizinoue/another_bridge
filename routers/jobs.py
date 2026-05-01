@@ -1,9 +1,11 @@
 from typing import Any
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
+from config import ANOTHER_CODER_RATE_LIMIT_JOBS
 from jobs import job_manager
+from services.rate_limiter import limiter
 
 log = structlog.get_logger()
 
@@ -11,7 +13,8 @@ router = APIRouter()
 
 
 @router.get("/jobs/{job_id}/status")
-def get_job_status_get(job_id: str) -> dict[str, Any]:
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_JOBS)
+def get_job_status_get(request: Request, job_id: str) -> dict[str, Any]:
     """Status endpoint. The platform's async webhook poller will hit this URL
     repeatedly until status != "running" or the platform-side timeout fires.
 
@@ -24,12 +27,14 @@ def get_job_status_get(job_id: str) -> dict[str, Any]:
 
 
 @router.post("/jobs/{job_id}/status")
-def get_job_status_post(job_id: str) -> dict[str, Any]:
-    return get_job_status_get(job_id)
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_JOBS)
+def get_job_status_post(request: Request, job_id: str) -> dict[str, Any]:
+    return get_job_status_get(request, job_id)
 
 
 @router.get("/jobs/{job_id}/chat/status")
-def get_chat_job_status(job_id: str) -> dict[str, Any]:
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_JOBS)
+def get_chat_job_status(request: Request, job_id: str) -> dict[str, Any]:
     """Polling endpoint for chat_stream jobs — returns the live snapshot
     of accumulated assistant text + done flag. Used by the platform's
     bridge-status proxy when a mobile client's SSE drops mid-stream and
@@ -52,7 +57,8 @@ def get_chat_job_status(job_id: str) -> dict[str, Any]:
 
 
 @router.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict[str, Any]:
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_JOBS)
+def cancel_job(request: Request, job_id: str) -> dict[str, Any]:
     """Cancel a running job. Triggered by the platform's executeTool
     dispatcher when the user cancels a chat turn — the platform aborts
     its polling fetch AND fires this endpoint so the Claude Code

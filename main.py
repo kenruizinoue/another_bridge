@@ -3,10 +3,13 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import Depends, FastAPI
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from auth import verify_api_key
 from config import CLAUDE_MODEL
 from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos
+from services.rate_limiter import limiter
 from services.reaper import build_default_reaper
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
@@ -34,6 +37,32 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Rate limiter wired into FastAPI's state + middleware stack. The
+# state binding is what slowapi's @limiter.limit decorators look for
+# at request time; SlowAPIMiddleware enforces the buckets and emits
+# 429 responses. RateLimitExceeded is also registered as an exception
+# handler so the 429 surfaces with slowapi's structured body
+# ({error: "rate limited", detail: "30 per 1 minute"}). See
+# services/rate_limiter.py for the key strategy + per-route limits
+# (those are applied in each router via @limiter.limit("...") on the
+# handler functions). CORS is intentionally NOT wired — this is a
+# webhook bridge consumed by the platform's server, not a browser,
+# so a CORS policy would be misleading.
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_exceeded_handler(_request, exc: RateLimitExceeded):
+    # Re-export slowapi's default 429 handler in our exception
+    # handler registry so a custom error shape can be added later
+    # without changing the import order in routers. For now,
+    # delegate to slowapi's default which produces:
+    #   {"error":"rate limited","detail":"30 per 1 minute"}
+    from slowapi import _rate_limit_exceeded_handler as _default
+
+    return _default(_request, exc)
 
 
 # /health stays unauthed — ngrok / uptime checks consume it without

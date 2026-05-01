@@ -6,12 +6,13 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import ValidationError
 
-from config import CLAUDE_MODEL, CODING_REPO_PATH
+from config import ANOTHER_CODER_RATE_LIMIT_INSTRUCT, CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
 from routers._schemas import PlanningRequest, first_error_message
 from routers.repos import validate_repo_path
 from services import claude_runner
 from services.errors import CANCELLED, CLAUDE_FAILED, SPAWN_FAILED, TIMEOUT
+from services.rate_limiter import limiter
 from services.repo_context import build_selected_repo_context
 from services.request import extract_args
 
@@ -319,6 +320,7 @@ def _run_planning_job(
 
 
 @router.post("/tools/instruct_planning")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_INSTRUCT)
 async def instruct_planning(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     try:
         body = await request.json()

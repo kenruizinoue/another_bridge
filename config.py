@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     another_coder_session_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=1)
     another_coder_reaper_interval_seconds: int = Field(default=600, ge=1)
 
+    # ── Rate limiting (Phase 4 audit follow-up) ────────────────────
+    # Public ngrok deployments are gated by a single shared
+    # X-Coder-Key, so a leaked key would be a full-shell foothold
+    # without these caps. Conservative defaults keyed on the
+    # X-Coder-Key (or remote IP fallback). Each limit is a slowapi
+    # spec like "60/minute" — empty string disables the limit on
+    # that surface. Tunable via env so a heavy demo can loosen
+    # without code changes.
+    another_coder_rate_limit_chat_stream: str = "30/minute"
+    another_coder_rate_limit_instruct: str = "10/minute"
+    # /jobs/* MUST stay generous — the platform's status-poll
+    # cadence is ~5s per active job + the bridge-status proxy
+    # mirrors that, so a single mid-flight Claude run can easily
+    # generate 12 GETs per minute.
+    another_coder_rate_limit_jobs: str = "600/minute"
+    another_coder_rate_limit_auth_verify: str = "60/minute"
+
 
 # Module-level singleton. Constructed at import; the rest of the
 # codebase reads frozen values via the back-compat constants below.
@@ -126,3 +143,12 @@ ANOTHER_CODER_SESSION_DB_PATH: str = (
 ANOTHER_CODER_JOB_TTL_SECONDS: int = settings.another_coder_job_ttl_seconds
 ANOTHER_CODER_SESSION_TTL_SECONDS: int = settings.another_coder_session_ttl_seconds
 ANOTHER_CODER_REAPER_INTERVAL_SECONDS: int = settings.another_coder_reaper_interval_seconds
+
+# Rate-limit constants — read by services/rate_limiter.py at
+# module import. A consumer that wants to tighten / loosen at
+# runtime should re-instantiate Settings() rather than mutating
+# these (same pattern build_default_reaper uses).
+ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM: str = settings.another_coder_rate_limit_chat_stream
+ANOTHER_CODER_RATE_LIMIT_INSTRUCT: str = settings.another_coder_rate_limit_instruct
+ANOTHER_CODER_RATE_LIMIT_JOBS: str = settings.another_coder_rate_limit_jobs
+ANOTHER_CODER_RATE_LIMIT_AUTH_VERIFY: str = settings.another_coder_rate_limit_auth_verify

@@ -3,15 +3,16 @@ import os
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from config import CLAUDE_MODEL, CODING_REPO_PATH
+from config import ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM, CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
 from routers.repos import validate_repo_path
 from services import claude_runner
 from services.errors import CANCELLED, CLAUDE_FAILED, SPAWN_FAILED
+from services.rate_limiter import limiter
 from services.session_store import session_store
 
 log = structlog.get_logger()
@@ -131,7 +132,8 @@ def normalize_repo_path(raw: Optional[str]) -> Optional[str]:
 
 
 @router.post("/chat/stream")
-def chat_stream(req: ChatStreamRequest):
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM)
+def chat_stream(request: Request, req: ChatStreamRequest):
     """Bridge chat from the platform to a local Claude Code subprocess.
 
     Wire format (SSE response) — kept tiny so the platform side stays

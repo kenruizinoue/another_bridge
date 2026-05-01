@@ -7,7 +7,13 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import ValidationError
 
-from config import CLAUDE_MODEL, CODING_REPO_PATH, GITHUB_DEFAULT_REPO, GITHUB_PAT
+from config import (
+    ANOTHER_CODER_RATE_LIMIT_INSTRUCT,
+    CLAUDE_MODEL,
+    CODING_REPO_PATH,
+    GITHUB_DEFAULT_REPO,
+    GITHUB_PAT,
+)
 from jobs import job_manager
 from routers._schemas import ImplementationRequest, first_error_message
 from routers.repos import validate_repo_path
@@ -20,6 +26,7 @@ from services.errors import (
     SPAWN_FAILED,
     TIMEOUT,
 )
+from services.rate_limiter import limiter
 from services.git_service import (
     _branch_exists_locally,
     _branch_exists_on_remote,
@@ -433,6 +440,7 @@ def _run_implementation_job(
 
 
 @router.post("/tools/instruct_implementation")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_INSTRUCT)
 async def instruct_implementation(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     try:
         body = await request.json()
