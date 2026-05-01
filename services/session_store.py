@@ -129,6 +129,19 @@ class SessionStore:
             self._conn.execute("DELETE FROM sessions")
             self._conn.commit()
 
+    def is_reachable(self) -> bool:
+        """Return True iff the SQLite connection responds to a trivial
+        query. Surfaced on /health so an operator on a remote deploy
+        can tell ``process up but DB locked`` apart from a healthy
+        bridge without tailing logs. Cheap — ``SELECT 1`` doesn't
+        scan rows or hit disk."""
+        try:
+            with self._lock:
+                self._conn.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
     def prune_older_than(self, max_age_seconds: int) -> int:
         """Delete rows whose ``last_seen_at`` is older than the
         threshold. Returns the deleted-row count for logging. Called

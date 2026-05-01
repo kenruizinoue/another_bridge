@@ -144,6 +144,27 @@ def test_concurrent_writes_dont_corrupt_state(tmp_path) -> None:
         assert store.get_session(f"conv-{i}") == f"sess-{i}-49"
 
 
+def test_is_reachable_returns_true_for_healthy_store(tmp_path) -> None:
+    """is_reachable powers the /health diagnostic. A freshly-opened
+    store on a writable file is the green path — anything else means
+    the connection is busted (closed conn, locked db, corrupted
+    schema). Locks the happy path so a refactor of the SELECT 1
+    probe doesn't accidentally always-return-False."""
+    store = SessionStore(db_path=str(tmp_path / "sessions.db"))
+    assert store.is_reachable() is True
+
+
+def test_is_reachable_returns_false_when_connection_is_closed(tmp_path) -> None:
+    """The most realistic failure mode: someone (a test, a botched
+    shutdown handler) closed the underlying connection. is_reachable
+    must catch sqlite3.ProgrammingError and report False rather than
+    bubbling the exception up to the /health route — uptime checks
+    can't tolerate /health 500ing."""
+    store = SessionStore(db_path=str(tmp_path / "sessions.db"))
+    store._conn.close()  # type: ignore[attr-defined]
+    assert store.is_reachable() is False
+
+
 def test_in_memory_db_works_without_filesystem(tmp_path) -> None:
     """The test suite uses ``:memory:`` via tests/conftest.py. Make
     sure the constructor doesn't trip on the missing parent-dir

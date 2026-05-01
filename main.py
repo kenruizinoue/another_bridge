@@ -40,6 +40,11 @@ async def lifespan(_app: FastAPI):
         log.info("claude.ready", version=detail)
     else:
         log.warning("claude.not_invocable", reason=detail)
+    # Stash on app.state so /health can surface it without re-running
+    # the probe per request. Operators on remote deploys (no easy log
+    # access) can curl /health to triage a stuck CLI without ssh-ing
+    # into the box.
+    _app.state.claude_probe = {"ok": ok, "detail": detail}
     reaper = build_default_reaper()
     reaper.start()
     try:
