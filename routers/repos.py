@@ -72,7 +72,7 @@ def list_workspace_repos(workspace_root: str) -> list[dict[str, Any]]:
 
 def validate_repo_path(
     repo_path: str,
-    workspace_root: str = WORKSPACE_ROOT,
+    workspace_root: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Validate repo_path and return (resolved_path, error_message).
 
@@ -82,7 +82,16 @@ def validate_repo_path(
     When workspace_root is unset, only checks isdir — preserves the
     pre-allow-list behavior so CODING_REPO_PATH deployments aren't broken
     by upgrading.
+
+    workspace_root resolution: when the caller passes None (the common
+    case from production code), we read the module-level WORKSPACE_ROOT
+    AT CALL TIME rather than at function-definition time. The previous
+    ``= WORKSPACE_ROOT`` default arg evaluated once at import, which
+    made it impossible for tests (and runtime config reloads) to
+    monkey-patch the env without re-importing the module.
     """
+    if workspace_root is None:
+        workspace_root = WORKSPACE_ROOT
     if not isinstance(repo_path, str) or not repo_path.strip():
         return None, "repo_path must be a non-empty string"
 

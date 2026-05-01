@@ -53,6 +53,26 @@ def _clean_jobs():
 # test_chat_polling.py for context.
 
 
+@pytest.fixture(autouse=True)
+def _bypass_repo_validation():
+    """These tests cover the normalize→Popen wiring (the original bug
+    was the literal ``\\ `` reaching Popen). After the security
+    hardening, /chat/stream also runs the path through
+    validate_repo_path — which would reject the synthetic
+    ``/tmp/AnohterAgent\\ Projects/repo`` paths these tests use because
+    they don't exist on disk. validate_repo_path is locked down by
+    its own tests (test_repo_path_traversal.py + test_chat_security.py),
+    so here we replace it with a passthrough that returns the input
+    verbatim. Wiring tests stay about wiring; security tests stay
+    about security."""
+    with patch.object(
+        chat_router,
+        "validate_repo_path",
+        side_effect=lambda p, *_a, **_k: (p, None),
+    ):
+        yield
+
+
 class _StubProc:
     """Minimal stand-in for subprocess.Popen. The chat_stream generator
     iterates ``proc.stdout`` and then calls ``proc.wait()``. We feed it
@@ -150,15 +170,18 @@ class TestRepoPathNormalization:
     def test_omitted_repo_path_falls_back_to_cwd(
         self, client: TestClient, stub_popen: MagicMock
     ) -> None:
-        """When repo_path is missing entirely, the endpoint falls back to
-        ``os.getcwd()`` — the normalizer must NOT swallow that path with
-        a None return that then gets cast to "None" or empty string."""
-        with client.stream(
-            "POST",
-            "/chat/stream",
-            json={"conversation_id": "conv-3", "message": "hi"},
-        ) as resp:
-            _consume_stream(resp)
+        """When repo_path is missing AND CODING_REPO_PATH is unset, the
+        endpoint falls back to ``os.getcwd()``. We blank the env var so
+        the wiring contract under test is the cwd fallback specifically;
+        the CODING_REPO_PATH-set case is covered separately by the
+        security tests."""
+        with patch.object(chat_router, "CODING_REPO_PATH", ""):
+            with client.stream(
+                "POST",
+                "/chat/stream",
+                json={"conversation_id": "conv-3", "message": "hi"},
+            ) as resp:
+                _consume_stream(resp)
 
         cwd = stub_popen.call_args.kwargs["cwd"]
         # os.getcwd() returns an absolute path; that's the contract
@@ -170,18 +193,20 @@ class TestRepoPathNormalization:
         self, client: TestClient, stub_popen: MagicMock
     ) -> None:
         """Pasted-whitespace edge — the normalizer returns None so the
-        ``or os.getcwd()`` fallback kicks in instead of Popen choking on
-        an empty cwd or a stray tab."""
-        with client.stream(
-            "POST",
-            "/chat/stream",
-            json={
-                "conversation_id": "conv-4",
-                "message": "hi",
-                "repo_path": "   \t  ",
-            },
-        ) as resp:
-            _consume_stream(resp)
+        fallback kicks in instead of Popen choking on an empty cwd or
+        a stray tab. CODING_REPO_PATH blanked so we exercise the cwd
+        leg of the fallback chain."""
+        with patch.object(chat_router, "CODING_REPO_PATH", ""):
+            with client.stream(
+                "POST",
+                "/chat/stream",
+                json={
+                    "conversation_id": "conv-4",
+                    "message": "hi",
+                    "repo_path": "   \t  ",
+                },
+            ) as resp:
+                _consume_stream(resp)
 
         cwd = stub_popen.call_args.kwargs["cwd"]
         assert cwd == os.getcwd()

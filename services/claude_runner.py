@@ -60,9 +60,18 @@ def build_claude_args(
     --dangerously-skip-permissions because every coder caller runs
     headless from a webhook — the user can't approve permission
     prompts from the platform UI.
+
+    The binary path comes from ``config.CLAUDE_BIN_PATH`` (env var
+    ``CLAUDE_BIN_PATH``) so NVM / nodenv / asdf users with ``claude``
+    living under ``~/.nvm/.../bin`` can pin it without relying on
+    uvicorn's inherited PATH. ``config`` is imported lazily inside
+    the function so a future test that monkey-patches the env can
+    take effect without re-importing this module.
     """
+    from config import CLAUDE_BIN_PATH
+
     args = [
-        "claude",
+        CLAUDE_BIN_PATH,
         "-p",
         prompt,
         "--model",
