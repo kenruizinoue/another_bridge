@@ -38,19 +38,8 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def _clean_jobs():
-    """Reset jobs the test created so the module-level singleton doesn't
-    leak between tests. Same pattern as test_jobs_router_cancel_http.py."""
-    before: set[str] = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    yield
-    after = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    for job_id in after - before:
-        job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
-
-
-# Session-map cleanup moved to tests/conftest.py — see the comment in
-# test_chat_polling.py for context.
+# Job + session-store cleanup moved to tests/conftest.py — see the
+# comment in test_chat_polling.py for context.
 
 
 @pytest.fixture(autouse=True)

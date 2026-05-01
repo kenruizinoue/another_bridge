@@ -38,18 +38,7 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def _clean_jobs():
-    """Reset jobs created during each test so module-level state doesn't
-    leak. Mirrors the pattern in test_jobs_router_cancel_http.py."""
-    before: set[str] = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    yield
-    after = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    for job_id in after - before:
-        job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
-
-
-# Session-map cleanup moved to tests/conftest.py — the conversation_id
+# Job + session-store cleanup both moved to tests/conftest.py — the conversation_id
 # → session_id store is now SQLite-backed and shared across the suite,
 # so wiping it once per test there avoids redefining the autouse fixture
 # in every chat-related test file.

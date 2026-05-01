@@ -9,13 +9,25 @@ suite from ever touching ``~/.another_coder/sessions.db`` (or
 whatever path a developer has configured for local dev) and remove
 the cross-test pollution risk that comes with a shared on-disk file.
 
-The autouse ``_clean_session_store`` fixture clears rows between
-cases so state from one test can't leak into the next.
+The autouse fixtures below replace per-file cleanup that several
+test files used to duplicate (Sprint 2 conftest consolidation):
+
+  - ``_clean_session_store`` — wipes SessionStore rows between cases.
+  - ``_clean_jobs`` — drops jobs the test created from JobManager.
+
+Shared fixtures (opt-in, not autouse):
+
+  - ``tmp_git_repo`` — initializes a real git repo in a tmp_path with
+    one commit + a bare-repo origin remote. Used by tests that need
+    to exercise git_service helpers / implementation flow without
+    inlining their own ``git init`` boilerplate.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 # Must run before any `from services.session_store import ...` happens.
 # pytest evaluates conftest.py before collecting + importing test
@@ -37,3 +49,70 @@ def _clean_session_store():
     session_store.clear_all()
     yield
     session_store.clear_all()
+
+
+@pytest.fixture(autouse=True)
+def _clean_jobs():
+    """Drop any jobs the test created so the module-level JobManager
+    singleton doesn't leak between tests. Captures the existing job
+    set on entry, then deletes everything new on exit — preserves
+    jobs created by other infrastructure (none today; defensive).
+    Centralized here so the four chat-related test files that used
+    to duplicate this fixture stay focused on their actual contracts."""
+    from jobs import job_manager
+
+    before: set[str] = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
+    yield
+    after = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
+    for job_id in after - before:
+        job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def tmp_git_repo(tmp_path: Path) -> Path:
+    """Build a real on-disk git repo with one commit + a bare-repo
+    origin remote. Returns the working-tree path. Tests that exercise
+    git_service helpers (``_run_git``, branch existence, base-branch
+    resolution) need a real repo because the helpers shell out to
+    actual git commands.
+
+    Layout::
+
+      tmp_path/
+        origin.git/   # bare remote (push/fetch target)
+        repo/         # working tree, returned to the test
+          .git/
+          README.md
+    """
+    work = tmp_path / "repo"
+    work.mkdir()
+    bare = tmp_path / "origin.git"
+    bare.mkdir()
+
+    def _run(args: list[str], cwd: Path) -> None:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed in {cwd}: {result.stderr}"
+            )
+
+    _run(["git", "init", "--bare", "--initial-branch=main"], bare)
+    _run(["git", "init", "--initial-branch=main"], work)
+    # Pin author/committer so the commit doesn't error in CI envs
+    # that don't have a global git identity.
+    _run(["git", "config", "user.email", "test@example.com"], work)
+    _run(["git", "config", "user.name", "Test User"], work)
+
+    (work / "README.md").write_text("hello\n")
+    _run(["git", "add", "README.md"], work)
+    _run(["git", "commit", "-m", "initial"], work)
+    _run(["git", "remote", "add", "origin", str(bare)], work)
+    _run(["git", "push", "-u", "origin", "main"], work)
+
+    return work

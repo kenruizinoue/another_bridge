@@ -45,17 +45,8 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def _clean_jobs():
-    before: set[str] = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    yield
-    after = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    for job_id in after - before:
-        job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
-
-
-# Session-store cleanup moved to tests/conftest.py — see the comment
-# in test_chat_polling.py for context.
+# Job + session-store cleanup moved to tests/conftest.py — see the
+# comment in test_chat_polling.py for context.
 
 
 def _consume(resp: Any) -> str:

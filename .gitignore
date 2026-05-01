@@ -6,3 +6,6 @@ venv/
 .venv-test/
 .pytest_cache/
 .claude/
+.coverage
+coverage.xml
+htmlcov/

@@ -26,16 +26,8 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture(autouse=True)
-def _clean_jobs():
-    """Snapshot job ids before each test so we can clear anything
-    created during the test, even if the test itself raises. Keeps the
-    module-level singleton from leaking state across tests."""
-    before: set[str] = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    yield
-    after = set(job_manager._jobs.keys())  # type: ignore[attr-defined]
-    for job_id in after - before:
-        job_manager._jobs.pop(job_id, None)  # type: ignore[attr-defined]
+# _clean_jobs autouse fixture now lives in tests/conftest.py — see
+# the comment in test_chat_polling.py for context.
 
 
 # ──────────────────────────────────────────────────────────────────────
