@@ -1,6 +1,17 @@
 import logging
 from contextlib import asynccontextmanager
 
+# Load .env into os.environ at import time. pydantic-settings already
+# reads .env into the Settings object, but it does NOT push values
+# back into os.environ — so consumers like auth.py that read
+# os.environ.get(...) directly would otherwise see empty values when
+# uvicorn is run standalone. Docker's env_file: .env handles this in
+# the container path; load_dotenv() handles the venv path. Tests
+# don't import main, so this is a no-op there.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import structlog
 from fastapi import Depends, FastAPI
 from slowapi.errors import RateLimitExceeded

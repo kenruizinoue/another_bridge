@@ -387,7 +387,6 @@ always set it.
 ## 7. Where to read next
 
 - [`README.md`](../README.md) — setup + operator's how-to.
-- [`SECURITY.md`](../SECURITY.md) — threat model, recommended deployment posture, key-rotation procedure. The "should I install this on my main laptop" doc.
+- [`docs/SECURITY.md`](SECURITY.md) — threat model, recommended deployment posture, key-rotation procedure. The "should I install this on my main laptop" doc.
 - [`docs/CURL_EXAMPLES.md`](CURL_EXAMPLES.md) — raw cURL probes for every route.
-- [`docs/TASKS.md`](TASKS.md) — tracked refactor backlog (Phase 1–4 + Sprint 2 test plan; Phase 1 + 2 + 3 (1) + 4 + Sprint 2 are landed).
-- [`TASKS.md`](../TASKS.md) — pre-publish security backlog (X-Coder-Key auth, the WORKSPACE_ROOT gate, etc.).
+- [`docs/TASKS.md`](TASKS.md) — pre-publish backlog + Before-Publish queue (Tier 1/2/3) tracking what's still open before the public release.

@@ -6,7 +6,7 @@ endpoints that mutate state or trigger work (e.g. `/chat/stream`,
 `/jobs/*`); `/health` stays unauthed so ngrok / uptime checks keep working
 without leaking the key into monitoring configs.
 
-Behavior intentionally tiny — see TASKS.md for the rationale and the list
+Behavior intentionally tiny — see docs/TASKS.md for the rationale and the list
 of features deliberately out of scope (JWT, OAuth, per-tool keys, rate
 limiting). Same key is configured server-side here and client-side in the
 calling AnotherAgent agent's `llmConfig.coderApiKey`.

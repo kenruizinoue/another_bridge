@@ -24,7 +24,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from routers import repos as repos_router
-from routers.repos import list_workspace_repos
+from routers.repos import list_workspace_repos, validate_repo_path
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -90,6 +90,85 @@ class TestListWorkspaceRepos:
             "origin_url": "git@github.com:acme/widgets.git",
             "owner_repo": "acme/widgets",
         }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# validate_repo_path: require_git_repo flag
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestValidateRepoPathPermissive:
+    """The chat flow opts out of the strict ``.git/`` + strict-subdir
+    requirements via ``require_git_repo=False``. Chat doesn't commit or
+    push, so a non-repo cwd is fine, and allowing the workspace root
+    itself lets Claude roam across repos for cross-cutting questions.
+    The path-bound (must be inside workspace_root) is preserved either
+    way — security floor doesn't move.
+    """
+
+    def test_permissive_accepts_workspace_root_itself(
+        self, tmp_path
+    ) -> None:
+        # Strict mode rejects this (planning + implementation need a
+        # specific repo). Permissive mode accepts it so chat can
+        # default to the workspace root and roam.
+        resolved, err = validate_repo_path(
+            str(tmp_path), workspace_root=str(tmp_path), require_git_repo=False,
+        )
+        assert err is None
+        assert resolved == str(tmp_path)
+
+    def test_permissive_accepts_non_git_subdir(self, tmp_path) -> None:
+        # A subdir inside workspace_root with NO .git/ — strict mode
+        # rejects ("not a git repository"), permissive accepts.
+        sub = tmp_path / "scratch"
+        sub.mkdir()
+        resolved, err = validate_repo_path(
+            str(sub), workspace_root=str(tmp_path), require_git_repo=False,
+        )
+        assert err is None
+        assert resolved == str(sub)
+
+    def test_permissive_still_bounds_to_workspace_root(self, tmp_path) -> None:
+        # Loosening the .git/ + strict-subdir checks must NOT loosen
+        # the workspace bound — that's the security boundary. A path
+        # outside workspace_root still gets rejected even in permissive
+        # mode.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        resolved, err = validate_repo_path(
+            str(outside), workspace_root=str(workspace), require_git_repo=False,
+        )
+        assert resolved is None
+        assert err is not None
+        assert "workspace" in err.lower()
+
+    def test_strict_default_still_rejects_workspace_root(
+        self, tmp_path
+    ) -> None:
+        # Lock that the default (require_git_repo=True) keeps the old
+        # behavior — planning + implementation must continue refusing
+        # to spawn at the workspace root.
+        resolved, err = validate_repo_path(
+            str(tmp_path), workspace_root=str(tmp_path),
+        )
+        assert resolved is None
+        assert err is not None
+        assert "inside" in err.lower()
+
+    def test_strict_default_still_requires_dot_git(self, tmp_path) -> None:
+        # Same lock for the .git/ check — strict mode rejects a non-repo
+        # subdir, permissive accepts.
+        sub = tmp_path / "scratch"
+        sub.mkdir()
+        resolved, err = validate_repo_path(
+            str(sub), workspace_root=str(tmp_path),
+        )
+        assert resolved is None
+        assert err is not None
+        assert ".git" in err
 
 
 # ──────────────────────────────────────────────────────────────────────

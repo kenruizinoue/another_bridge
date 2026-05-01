@@ -5,9 +5,9 @@ doc. It describes what trust boundary `another_coder` actually defends,
 what it doesn't, and how to harden a deployment.
 
 If you're just looking for the operator's how-to, start at the
-[README](README.md). For sequence diagrams of the runtime flows, see
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). This doc is the
-"threat model" complement to those.
+[README](../README.md). For sequence diagrams of the runtime flows, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md). This doc is the "threat model"
+complement to those.
 
 ---
 
@@ -263,13 +263,10 @@ re-establish with the new secret.
 If you find a vulnerability — particularly a path traversal that
 escapes `WORKSPACE_ROOT`, an auth bypass, a secret leak in logs, or
 anything that could let an unauthenticated caller spawn a subprocess
-— please report privately. Don't open a public issue with details.
+— please report it via GitHub Security Advisories on this repo
+rather than opening a public issue.
 
-(Repo owner: add your preferred contact channel here — security@…
-email, GitHub Security Advisory, etc.)
-
-A few things this project considers in-scope vs out-of-scope for
-"vulnerability" reports:
+In-scope vs out-of-scope:
 
 **In scope:**
 - Path traversal escaping `WORKSPACE_ROOT`.

@@ -159,7 +159,7 @@ class SessionStore:
 
 
 # Module-level singleton — every chat_stream request shares the same
-# connection. Mirrors the existing job_manager pattern; both should
-# eventually move behind FastAPI Depends() per docs/TASKS.md Phase 3
-# sub-item 2, but that's a separate refactor.
+# connection. Mirrors the existing job_manager pattern; both could
+# eventually move behind FastAPI Depends() but that's a separate
+# refactor.
 session_store = SessionStore()

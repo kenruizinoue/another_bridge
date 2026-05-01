@@ -73,6 +73,7 @@ def list_workspace_repos(workspace_root: str) -> list[dict[str, Any]]:
 def validate_repo_path(
     repo_path: str,
     workspace_root: str | None = None,
+    require_git_repo: bool = True,
 ) -> tuple[str | None, str | None]:
     """Validate repo_path and return (resolved_path, error_message).
 
@@ -89,6 +90,16 @@ def validate_repo_path(
     ``= WORKSPACE_ROOT`` default arg evaluated once at import, which
     made it impossible for tests (and runtime config reloads) to
     monkey-patch the env without re-importing the module.
+
+    require_git_repo (default True): when True (planning + implementation
+    flows) the candidate must be a STRICT subdirectory of workspace_root
+    AND contain a ``.git/`` dir — those flows commit, push, and open PRs
+    so a non-repo path would fail later anyway. When False (the chat
+    flow) the candidate is allowed to BE the workspace root itself, and
+    the .git/ check is skipped — chat doesn't commit, and a workspace-
+    root cwd lets Claude roam across repos for cross-cutting questions.
+    The path-bound (must be inside workspace_root) is preserved either
+    way; it's the security floor.
     """
     if workspace_root is None:
         workspace_root = WORKSPACE_ROOT
@@ -109,14 +120,20 @@ def validate_repo_path(
     except ValueError:
         return None, f"repo_path is outside the workspace root: {repo_path}"
 
-    if common != workspace_resolved or candidate == workspace_resolved:
+    if common != workspace_resolved:
         return (
             None,
             f"repo_path must be a directory inside {workspace_root}, got: {repo_path}",
         )
 
-    if not os.path.isdir(os.path.join(candidate, ".git")):
-        return None, f"repo_path is not a git repository (no .git/ found): {repo_path}"
+    if require_git_repo:
+        if candidate == workspace_resolved:
+            return (
+                None,
+                f"repo_path must be a directory inside {workspace_root}, got: {repo_path}",
+            )
+        if not os.path.isdir(os.path.join(candidate, ".git")):
+            return None, f"repo_path is not a git repository (no .git/ found): {repo_path}"
 
     return candidate, None
 

@@ -7,7 +7,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from config import ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM, CLAUDE_MODEL, CODING_REPO_PATH
+from config import (
+    ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM,
+    CLAUDE_MODEL,
+    CODING_REPO_PATH,
+    WORKSPACE_ROOT,
+)
 from jobs import job_manager
 from routers.repos import validate_repo_path
 from services import claude_runner
@@ -177,16 +182,27 @@ def chat_stream(request: Request, req: ChatStreamRequest):
     #
     # /tools/instruct_planning and /tools/instruct_implementation
     # already gate via validate_repo_path; this endpoint must do the
-    # same. Resolution order mirrors those siblings: explicit body
-    # field → CODING_REPO_PATH env → os.getcwd() (legacy fallback).
+    # same. Resolution order: explicit body field → WORKSPACE_ROOT
+    # (so chat without an explicit repo lands at the workspace root
+    # by default and can roam across repos) → CODING_REPO_PATH env
+    # (legacy compat) → os.getcwd() (last-resort fallback).
     # Normalize first so paste-style escapes (\\ , ~) don't slip past
     # the validator on a path that would otherwise be in-bounds.
+    #
+    # Chat passes require_git_repo=False because: (a) it doesn't
+    # commit/push, so a non-repo cwd is fine; (b) allowing the
+    # workspace root itself lets Claude answer cross-repo questions
+    # like "find all auth code across my projects". Planning and
+    # implementation keep the strict default — they need a real repo.
     raw_repo_path = (
         normalize_repo_path(req.repo_path)
+        or WORKSPACE_ROOT
         or CODING_REPO_PATH
         or os.getcwd()
     )
-    resolved_repo_path, repo_err = validate_repo_path(raw_repo_path)
+    resolved_repo_path, repo_err = validate_repo_path(
+        raw_repo_path, require_git_repo=False,
+    )
     if repo_err:
         # 400 surfaces to the platform's bridge dispatcher as a clean
         # HTTP error, which propagates back to the LLM/trace as an

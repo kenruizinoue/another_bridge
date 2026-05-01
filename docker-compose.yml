@@ -25,23 +25,35 @@ services:
     env_file:
       - .env
     environment:
-      # Override the in-container defaults to match the bind mounts
-      # below. WORKSPACE_ROOT points at the mount target; the
-      # session DB lives in the named volume so it survives `docker
-      # compose down` (without the volume, conversation continuity
-      # would reset on every restart — defeats the SQLite migration).
-      WORKSPACE_ROOT: /workspace
+      # The session DB has no host equivalent (it lives in a named
+      # volume), so its container-internal path stays overridden here.
+      # WORKSPACE_ROOT is intentionally NOT overridden — it comes
+      # straight from .env, which the 1:1 bind mount below makes
+      # work identically inside and outside the container.
       ANOTHER_CODER_SESSION_DB_PATH: /data/sessions.db
+      # Claude refuses --dangerously-skip-permissions when EUID==0
+      # unless IS_SANDBOX=1 signals "yes, this IS a controlled
+      # container — that's the whole point of running here." The
+      # bridge always passes the flag (headless spawns can't approve
+      # permission prompts), so without this the chat path fails
+      # immediately with a non-actionable error.
+      IS_SANDBOX: "1"
     volumes:
-      # Your workspace — the parent of every repo Claude Code is
-      # allowed to spawn in. Read-write because Claude Code edits
-      # files. Adjust the host path on the LEFT to your machine.
-      - ${HOST_WORKSPACE:-${HOME}/Projects}:/workspace:rw
-      # claude CLI auth — the containerized `claude` binary inherits
-      # your host's authenticated session so you don't `claude login`
-      # per restart. Read-write because some claude workflows update
-      # cached credentials.
+      # Workspace — bind-mounted 1:1 so the same path that exists
+      # on your host also resolves inside the container. Compose
+      # reads WORKSPACE_ROOT directly from .env (same value the
+      # bridge uses for path validation), so there's a single
+      # source of truth and no host/container path translation.
+      - ${WORKSPACE_ROOT:-${HOME}/Projects}:${WORKSPACE_ROOT:-${HOME}/Projects}:rw
+      # claude CLI auth lives in TWO places on the host:
+      #   - $HOME/.claude/        — the directory (caches, projects)
+      #   - $HOME/.claude.json    — the top-level config + session token
+      # Both must be mounted; missing the second one produces
+      # "Claude configuration file not found at /root/.claude.json"
+      # because the file is at the parent of $HOME/.claude/, not
+      # inside it.
       - ${HOST_CLAUDE_DIR:-${HOME}/.claude}:/root/.claude:rw
+      - ${HOST_CLAUDE_CONFIG:-${HOME}/.claude.json}:/root/.claude.json:rw
       # Persistent session DB. Named volume (rather than bind mount)
       # because the path is internal to the container.
       - sessions:/data

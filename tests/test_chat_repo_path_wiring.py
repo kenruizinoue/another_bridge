@@ -159,12 +159,15 @@ class TestRepoPathNormalization:
     def test_omitted_repo_path_falls_back_to_cwd(
         self, client: TestClient, stub_popen: MagicMock
     ) -> None:
-        """When repo_path is missing AND CODING_REPO_PATH is unset, the
-        endpoint falls back to ``os.getcwd()``. We blank the env var so
-        the wiring contract under test is the cwd fallback specifically;
-        the CODING_REPO_PATH-set case is covered separately by the
-        security tests."""
-        with patch.object(chat_router, "CODING_REPO_PATH", ""):
+        """When repo_path is missing AND both env defaults
+        (WORKSPACE_ROOT, CODING_REPO_PATH) are unset, the endpoint
+        falls back to ``os.getcwd()``. We blank both env vars to lock
+        the cwd-fallback leg specifically; the WORKSPACE_ROOT-default
+        and CODING_REPO_PATH-set cases are covered by the new
+        TestRepoPathDefaultFallback class below."""
+        with patch.object(chat_router, "WORKSPACE_ROOT", ""), patch.object(
+            chat_router, "CODING_REPO_PATH", ""
+        ):
             with client.stream(
                 "POST",
                 "/chat/stream",
@@ -182,10 +185,12 @@ class TestRepoPathNormalization:
         self, client: TestClient, stub_popen: MagicMock
     ) -> None:
         """Pasted-whitespace edge — the normalizer returns None so the
-        fallback kicks in instead of Popen choking on an empty cwd or
-        a stray tab. CODING_REPO_PATH blanked so we exercise the cwd
-        leg of the fallback chain."""
-        with patch.object(chat_router, "CODING_REPO_PATH", ""):
+        fallback chain kicks in instead of Popen choking on an empty
+        cwd or a stray tab. Both env defaults blanked so the chain
+        runs through to its terminal os.getcwd() leg."""
+        with patch.object(chat_router, "WORKSPACE_ROOT", ""), patch.object(
+            chat_router, "CODING_REPO_PATH", ""
+        ):
             with client.stream(
                 "POST",
                 "/chat/stream",
@@ -199,6 +204,56 @@ class TestRepoPathNormalization:
 
         cwd = stub_popen.call_args.kwargs["cwd"]
         assert cwd == os.getcwd()
+
+
+class TestRepoPathDefaultFallback:
+    """The fallback chain when ``repo_path`` is omitted from the body:
+    explicit field → WORKSPACE_ROOT → CODING_REPO_PATH → os.getcwd().
+
+    WORKSPACE_ROOT-as-default is the chat-friendly behavior added so a
+    user can leave the platform's Settings → Integrations → Repo path
+    field blank and have chat land at the workspace root by default,
+    which lets Claude roam across repos for cross-cutting questions.
+    Locking it so a future refactor that flips the chain order (e.g.
+    putting CODING_REPO_PATH first again) trips this test.
+    """
+
+    def test_omitted_repo_path_defaults_to_workspace_root(
+        self, client: TestClient, stub_popen: MagicMock
+    ) -> None:
+        with patch.object(
+            chat_router, "WORKSPACE_ROOT", "/tmp/some/workspace"
+        ), patch.object(chat_router, "CODING_REPO_PATH", "/tmp/legacy/repo"):
+            with client.stream(
+                "POST",
+                "/chat/stream",
+                json={"conversation_id": "conv-ws", "message": "hi"},
+            ) as resp:
+                _consume_stream(resp)
+
+        cwd = stub_popen.call_args.kwargs["cwd"]
+        # WORKSPACE_ROOT wins over CODING_REPO_PATH when both are set
+        # and no body field is provided.
+        assert cwd == "/tmp/some/workspace"
+
+    def test_workspace_root_blank_falls_through_to_coding_repo_path(
+        self, client: TestClient, stub_popen: MagicMock
+    ) -> None:
+        # Legacy CODING_REPO_PATH-only deployments must keep working —
+        # they predate WORKSPACE_ROOT and a quiet behavior change here
+        # would silently break their chat default.
+        with patch.object(chat_router, "WORKSPACE_ROOT", ""), patch.object(
+            chat_router, "CODING_REPO_PATH", "/tmp/legacy/repo"
+        ):
+            with client.stream(
+                "POST",
+                "/chat/stream",
+                json={"conversation_id": "conv-legacy", "message": "hi"},
+            ) as resp:
+                _consume_stream(resp)
+
+        cwd = stub_popen.call_args.kwargs["cwd"]
+        assert cwd == "/tmp/legacy/repo"
 
 
 class TestKickoffEvent:

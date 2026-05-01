@@ -101,7 +101,9 @@ Verify in another terminal:
 
 ```bash
 curl http://127.0.0.1:8000/health
-# {"ok": true, "service": "another_coder"}
+# {"ok":true,"service":"another_coder","version":"0.1.0",
+#  "claude_probe":{"ok":true,"detail":"claude-code 1.x.y"},
+#  "session_store_reachable":true}
 ```
 
 ### 4. Expose via ngrok
@@ -172,7 +174,7 @@ For the bridge: open a chat with any `claude_code`-engine agent and just chat. C
 Auth is checked before any handler runs (router-level FastAPI `Depends(verify_api_key)`). Rate limiting uses `slowapi`, keyed on the `X-Coder-Key` header (with remote-IP fallback). CORS is intentionally **not** wired — this is a server-to-server bridge, not a browser-facing API.
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — sequence diagrams of the bridge SSE flow, the webhook polling flow, the TTL reaper, the persistence layout.
-- [`SECURITY.md`](SECURITY.md) — threat model, recommended deployment posture, key-rotation procedure. Read this before exposing the bridge over ngrok.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, recommended deployment posture, key-rotation procedure. Read this before exposing the bridge over ngrok.
 - [`docs/CURL_EXAMPLES.md`](docs/CURL_EXAMPLES.md) — raw cURL probes for every route.
 
 ---
@@ -241,27 +243,53 @@ CI runs the same suite + coverage gate on every PR to `dev` (`.github/workflows/
 
 ---
 
-## Running in Docker (optional — for VPS / home-server deployments)
+## Running in Docker (optional)
 
-Laptop users: stick with the venv path above. Docker only earns its keep when you're running the bridge somewhere other than your dev machine — it collapses the install matrix (Python + Node + claude CLI + Python deps) into one `docker compose up`.
+Two cases where Docker is the right path: you don't want Python + Node installed directly on your host, or you're deploying somewhere other than your dev machine. Either way it collapses the install matrix into one `docker compose up`.
 
 ```bash
 cp .env.example .env
-# Fill in ANOTHER_CODER_API_KEY + WORKSPACE_ROOT etc.
-
-# Optional overrides (else docker-compose.yml uses your $HOME/Projects + $HOME/.claude):
-export HOST_WORKSPACE=/path/to/your/repos
-export HOST_CLAUDE_DIR=$HOME/.claude
+# Fill in ANOTHER_CODER_API_KEY, GITHUB_PAT, WORKSPACE_ROOT, etc.
 
 docker compose up --build
 ```
 
-Two host directories must be bind-mounted into the container:
+Two host directories are bind-mounted into the container:
 
-- **`$HOME/Projects` → `/workspace`** — Claude Code reads + writes here. Set `WORKSPACE_ROOT=/workspace` in the env so the bounds gate works.
-- **`$HOME/.claude` → `/root/.claude`** — the containerized `claude` binary inherits your host's authenticated session. Without this mount you'd `claude login` inside the container on every restart.
+- **`WORKSPACE_ROOT` (1:1)** — read straight from `.env` and mounted at the same path inside the container, so `WORKSPACE_ROOT` is the source of truth in both venv and Docker deployments. Whatever path the platform sends as `repo_path` resolves identically in both — no translation.
+- **`$HOME/.claude` → `/root/.claude`** + **`$HOME/.claude.json` → `/root/.claude.json`** — Claude's auth state lives in TWO host locations: a directory (caches, projects) and a top-level config file (session token). Both are mounted so the containerized binary inherits your host's authenticated session and you don't `claude login` per restart. Override with `HOST_CLAUDE_DIR` / `HOST_CLAUDE_CONFIG` if your CLI auth lives elsewhere. **First-time Docker users:** if you've never run `claude` on this host, both files are missing — Docker auto-creates them as empty dirs (wrong type) and the container errors. Run `claude login` once on host **OR** `touch ~/.claude.json && mkdir -p ~/.claude` before `docker compose up`, then run `docker compose run --rm another_coder claude login` for the actual auth.
 
 The session DB lives in a named Docker volume (`sessions`) so conversation continuity survives `docker compose down`. See [`docker-compose.yml`](docker-compose.yml) for the full layout + the [`Dockerfile`](Dockerfile) for the build details.
+
+#### First-run: claude authentication
+
+Even with Docker handling Python + Node, the `claude` CLI still needs to log in once — that's an Anthropic-account credential, not something Docker can bake in. **On macOS specifically**, the host's claude stores its OAuth token in the macOS Keychain, which Linux containers can't reach. The bind mount of `~/.claude.json` only carries metadata, not the actual token. So even if you've already run `claude login` on your Mac, the container will still report "Not logged in."
+
+The fix is a one-time login *inside* the container:
+
+```bash
+docker compose run --rm another_coder claude login
+```
+
+(The `--rm` flag auto-deletes the one-shot container after the command exits — the auth token persists via the bind mount, so the container itself isn't worth keeping.)
+
+The login flow gives you a URL + a code. Open the URL in any browser, authenticate, paste the code back. Linux claude inside the container falls back to file-based token storage when no system keychain is available, so the token lands in `/root/.claude.json` — which is the bind-mounted host path. Every subsequent `docker compose up` reuses it.
+
+Linux/WSL hosts: if you've already run `claude login` on the host (file-based auth there too), the bind mount may pick it up directly. Try `docker compose up` first; only fall back to the in-container login if you see "Not logged in."
+
+**Laptop-dev recommendation:** if you're testing on a Mac, the venv path above is significantly simpler — no Keychain isolation, no per-container login dance. Docker earns its keep when you're deploying to a VPS or home server, not for local iteration.
+
+#### Windows users
+
+The `$HOME/Projects` and `$HOME/.claude` defaults assume Unix-style paths. On Windows (Docker Desktop with WSL2), set `WORKSPACE_ROOT` in `.env` to your actual workspace path and override `HOST_CLAUDE_DIR` in the shell if needed:
+
+```powershell
+# In .env: WORKSPACE_ROOT=C:\Users\you\Projects
+$env:HOST_CLAUDE_DIR = "C:\Users\you\.claude"
+docker compose up --build
+```
+
+The container itself is always Linux — only the host-side bind-mount paths differ.
 
 ---
 

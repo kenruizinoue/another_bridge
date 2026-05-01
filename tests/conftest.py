@@ -52,6 +52,22 @@ def _clean_session_store():
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Drain slowapi's in-memory bucket between tests so a heavy-traffic
+    test in one file (or a new test class that adds more /chat/stream
+    calls) can't exhaust the per-route cap and trip 429s in unrelated
+    later tests. All TestClient calls share the same fake remote-IP
+    (``testclient``), so without a reset the bucket accumulates across
+    the whole suite. Production deploys aren't affected — every real
+    caller has a distinct IP/key."""
+    from services.rate_limiter import limiter
+
+    limiter.reset()
+    yield
+    limiter.reset()
+
+
+@pytest.fixture(autouse=True)
 def _clean_jobs():
     """Drop any jobs the test created so the module-level JobManager
     singleton doesn't leak between tests. Captures the existing job
