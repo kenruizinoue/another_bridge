@@ -1,0 +1,93 @@
+# Modern Python project metadata + dependency declaration.
+#
+# Replaces requirements.txt + requirements-dev.txt. Source of truth
+# for: project version, runtime deps, dev deps, Python compatibility,
+# build backend.
+#
+# Install:
+#   pip install .                  # production deps only
+#   pip install -e ".[dev]"        # editable + dev deps (tests, coverage)
+#
+# CI uses the editable + dev install. Dockerfile uses production-only.
+# README's Development section documents both paths.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "another_coder"
+# Bumped on each release. Surfaced in /health so bug reports include
+# the version automatically. Single source of truth — main.py reads
+# it via importlib.metadata so we don't drift between the package
+# manifest and the runtime.
+version = "0.1.0"
+description = "FastAPI bridge that exposes local Claude Code as an HTTP/SSE API for the AnotherAgent platform."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Ken Ruiz Inoue" },
+]
+keywords = [
+    "claude-code",
+    "anotheragent",
+    "agent",
+    "fastapi",
+    "bridge",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Framework :: FastAPI",
+    "Topic :: Software Development",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "fastapi>=0.103.0",
+    "uvicorn>=0.23.2",
+    # python-dotenv is still needed — pydantic-settings reads .env via
+    # this when SettingsConfigDict.env_file is set.
+    "python-dotenv>=1.0.0",
+    "pydantic-settings>=2.0",
+    "requests>=2.31.0",
+    "slowapi>=0.1.9",
+    "structlog>=25.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    # Coverage gate (configured in pytest.ini, --cov-fail-under=70).
+    "pytest-cov>=4.0",
+    # Required by fastapi.testclient.TestClient (Starlette's HTTP test
+    # transport).
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+# Update once published to a public repo. Placeholder values flagged
+# so a future grep -r "another_coder/another_coder" surfaces them.
+Homepage = "https://github.com/another_coder/another_coder"
+Documentation = "https://github.com/another_coder/another_coder/blob/dev/docs/ARCHITECTURE.md"
+Repository = "https://github.com/another_coder/another_coder"
+Issues = "https://github.com/another_coder/another_coder/issues"
+Changelog = "https://github.com/another_coder/another_coder/blob/dev/CHANGELOG.md"
+
+# Single-app layout: main.py + auth.py + config.py + jobs.py at the
+# repo root, routers/ + services/ as packages. setuptools needs the
+# explicit list because it can't auto-discover py-modules at the
+# project root reliably (the auto-discovery picks up ``tests`` and
+# the .venv otherwise).
+[tool.setuptools]
+py-modules = ["auth", "config", "jobs", "main"]
+
+[tool.setuptools.packages.find]
+include = ["routers*", "services*"]
+exclude = ["tests*", "docs*", ".venv*", ".venv-test*"]

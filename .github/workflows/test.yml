@@ -24,15 +24,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # Cache pip's wheel directory keyed on the dev requirements
-          # file. Saves ~30s on every run after the first.
+          # Cache pip's wheel directory keyed on the project metadata.
+          # pyproject.toml is the single source of truth for runtime +
+          # dev dependencies (replaced requirements*.txt). Saves ~30s
+          # on every run after the first.
           cache: pip
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          # Editable install with the [dev] extras — gives us pytest,
+          # pytest-cov, httpx alongside the runtime deps.
+          pip install -e ".[dev]"
 
       - name: Run tests + coverage gate
         # pytest.ini wires --cov + --cov-fail-under=70 into addopts,

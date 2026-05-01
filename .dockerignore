@@ -9,6 +9,9 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+*.egg-info/
+build/
+dist/
 
 # Virtualenvs
 venv/
@@ -30,7 +33,6 @@ venv/
 # would just enlarge it. CI runs tests in a separate workflow.
 tests/
 pytest.ini
-requirements-dev.txt
 
 # Docs / git artifacts (not used at runtime)
 .git/

@@ -9,3 +9,7 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+# pip install -e . creates this; same for `python -m build`.
+*.egg-info/
+build/
+dist/

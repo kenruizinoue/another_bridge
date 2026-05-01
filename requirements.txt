@@ -1,9 +1,0 @@
-fastapi>=0.103.0
-uvicorn>=0.23.2
-# python-dotenv is still needed — pydantic-settings reads .env via
-# this when SettingsConfigDict.env_file is set.
-python-dotenv>=1.0.0
-pydantic-settings>=2.0
-requests>=2.31.0
-slowapi>=0.1.9
-structlog>=25.5.0

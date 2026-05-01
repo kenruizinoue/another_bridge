@@ -34,8 +34,10 @@ When wired up:
 git clone <this-repo-url> another_coder
 cd another_coder
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install .
 ```
+
+Project metadata (deps, version, etc.) lives in [`pyproject.toml`](pyproject.toml). For dev/test work that includes `pytest` + `pytest-cov`, use `pip install -e ".[dev]"` instead.
 
 ### 2. Configure `.env`
 
@@ -227,7 +229,7 @@ Auth is checked before any handler runs (router-level FastAPI `Depends(verify_ap
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e ".[dev]"    # editable install + pytest, pytest-cov, httpx
 pytest                     # full suite + coverage gate at 70%
 pytest --no-cov            # iterate without the coverage gate
 pytest tests/test_chat_security.py -v  # run a focused file

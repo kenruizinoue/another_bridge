@@ -74,16 +74,20 @@ COPY --from=claude_cli /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 WORKDIR /app
 
-# Install Python deps in a separate layer so requirement changes
-# don't bust the source layer's cache.
-COPY requirements.txt requirements-dev.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the source last — this layer rebuilds on every code change,
-# but the previous (heavier) layers stay cached.
+# Copy project metadata + source. Unlike the requirements.txt
+# pattern (where deps could be installed before source for layer
+# caching), pyproject.toml + setuptools needs the source files to
+# build the package. Acceptable trade-off for a project this size —
+# deps + source rebuild together when either changes. If layer
+# caching becomes a real bottleneck later, switch to uv / pdm /
+# pip-tools to lock deps into a separate file.
+COPY pyproject.toml ./
 COPY auth.py config.py jobs.py main.py ./
 COPY routers/ ./routers/
 COPY services/ ./services/
+
+# Production install — runtime deps only, no dev/test extras.
+RUN pip install --no-cache-dir .
 
 # Defaults that align with the host-mount expectation. Operators
 # override via --env-file or -e at runtime; these are just so
