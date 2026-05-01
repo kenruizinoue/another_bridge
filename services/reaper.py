@@ -33,7 +33,6 @@ the thread and drive ``prune_once()`` synchronously.
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Optional
 
@@ -43,9 +42,12 @@ from jobs import JobManager
 from services.session_store import SessionStore
 
 
-# Defaults sized for a single-user / small-team deployment. Override
-# via env in production if a longer post-mortem window is wanted on
-# failed jobs (e.g. for trace forensics).
+# Defaults are kept as module-level constants here (not pulled from
+# config) so the test suite can pin against expected numbers without
+# importing config — avoids a circular dance when tests construct
+# Reaper directly with explicit kwargs. Production wiring runs
+# through ``build_default_reaper`` which reads ``Settings()`` fresh
+# (so mid-process env overrides from tests do take effect).
 JOB_TTL_SECONDS_DEFAULT = 60 * 60                # 1h: status endpoints rarely
                                                  # care about a result older
                                                  # than this — the platform's
@@ -57,17 +59,6 @@ REAPER_INTERVAL_SECONDS_DEFAULT = 10 * 60        # 10min: low frequency keeps
                                                  # the daemon out of the way of
                                                  # the request path; reaper
                                                  # latency doesn't matter.
-
-
-def _env_seconds(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        v = int(raw)
-        return v if v > 0 else default
-    except ValueError:
-        return default
 
 
 log = structlog.get_logger()
@@ -175,23 +166,41 @@ class Reaper:
 def build_default_reaper() -> Reaper:
     """Compose a reaper from the module-level singletons + env-tuned
     thresholds. Called by ``main.py``'s lifespan; tests use the class
-    directly with explicit arguments."""
+    directly with explicit arguments.
+
+    Reads the reaper tunables by instantiating ``config.Settings()``
+    fresh inside the function so a test that monkey-patches the env
+    after import sees its overrides take effect. The module-level
+    ``config.settings`` singleton was captured at import time and
+    won't reflect later changes — that's fine for normal runtime,
+    not for tests. A bad env value (``"not-a-number"``, negative,
+    zero) falls back to the documented default rather than raising
+    so a typo can't silently disable cleanup or take down the boot.
+    """
     from jobs import job_manager
     from services.session_store import session_store
+    from pydantic import ValidationError
+
+    from config import Settings
+
+    try:
+        s = Settings()
+        job_ttl = s.another_coder_job_ttl_seconds
+        session_ttl = s.another_coder_session_ttl_seconds
+        interval = s.another_coder_reaper_interval_seconds
+    except ValidationError:
+        # Field constraints (ge=1) failed — fall back to documented
+        # defaults rather than crashing the boot. Logged so the
+        # operator notices the misconfig.
+        log.warning("reaper.invalid_env_using_defaults")
+        job_ttl = JOB_TTL_SECONDS_DEFAULT
+        session_ttl = SESSION_TTL_SECONDS_DEFAULT
+        interval = REAPER_INTERVAL_SECONDS_DEFAULT
 
     return Reaper(
         job_manager=job_manager,
         session_store=session_store,
-        job_ttl_seconds=_env_seconds(
-            "ANOTHER_CODER_JOB_TTL_SECONDS",
-            JOB_TTL_SECONDS_DEFAULT,
-        ),
-        session_ttl_seconds=_env_seconds(
-            "ANOTHER_CODER_SESSION_TTL_SECONDS",
-            SESSION_TTL_SECONDS_DEFAULT,
-        ),
-        interval_seconds=_env_seconds(
-            "ANOTHER_CODER_REAPER_INTERVAL_SECONDS",
-            REAPER_INTERVAL_SECONDS_DEFAULT,
-        ),
+        job_ttl_seconds=job_ttl,
+        session_ttl_seconds=session_ttl,
+        interval_seconds=interval,
     )

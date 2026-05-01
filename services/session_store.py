@@ -30,7 +30,6 @@ without a separate write path.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
@@ -38,12 +37,14 @@ from pathlib import Path
 from typing import Optional
 
 
-# Resolved at module import. Tests set this to ``":memory:"`` via
-# ``tests/conftest.py`` before importing anything that touches the
-# store, so no real on-disk file gets created during the suite.
-DEFAULT_DB_PATH = os.environ.get(
-    "ANOTHER_CODER_SESSION_DB_PATH",
-) or str(Path.home() / ".another_coder" / "sessions.db")
+# Path resolution lives in config.py now (Phase 3 sub-item 1) — the
+# pydantic-settings ``Settings`` class reads ANOTHER_CODER_SESSION_DB_PATH
+# at import and falls back to ``~/.another_coder/sessions.db`` when
+# unset. Tests set the env var to ``":memory:"`` via ``tests/conftest.py``
+# BEFORE config is imported, so no real on-disk file gets created during
+# the suite. The constant is re-exported here for any caller that wants
+# to ``from services.session_store import DEFAULT_DB_PATH``.
+from config import ANOTHER_CODER_SESSION_DB_PATH as DEFAULT_DB_PATH
 
 
 _SCHEMA = """
