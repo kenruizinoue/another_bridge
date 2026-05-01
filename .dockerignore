@@ -1,0 +1,47 @@
+# Keep the build context tight — anything not copied by the
+# Dockerfile's COPY instructions just slows down `docker build`.
+
+# Python ephemera
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtualenvs
+venv/
+.venv/
+.venv-test/
+
+# Local config + secrets — the image expects env via --env-file or
+# environment vars at runtime, not baked into the layer.
+.env
+.env.local
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Tests + dev-only files. The bridge image runs production code
+# only; pytest + fixtures aren't needed in the runtime image and
+# would just enlarge it. CI runs tests in a separate workflow.
+tests/
+pytest.ini
+requirements-dev.txt
+
+# Docs / git artifacts (not used at runtime)
+.git/
+.github/
+.gitignore
+*.md
+docs/
+LICENSE
+profiles/
+
+# Docker meta (we're not building this from inside a container)
+Dockerfile
+docker-compose.yml
+.dockerignore

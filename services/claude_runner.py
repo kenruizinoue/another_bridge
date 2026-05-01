@@ -31,6 +31,56 @@ from typing import Iterator
 from jobs import job_manager
 
 
+def probe_claude_binary(timeout_seconds: float = 5.0) -> tuple[bool, str]:
+    """Run ``<CLAUDE_BIN_PATH> --version`` so the operator finds out at
+    boot — not at first chat — that the CLI is missing or broken.
+
+    Three failure modes the operator will hit on a fresh install:
+
+      * ``FileNotFoundError`` — `claude` not on PATH and CLAUDE_BIN_PATH
+        unset (or pointing at a stale path after an NVM upgrade).
+      * Non-zero exit — claude installed but auth expired / corrupted.
+      * Timeout — claude hung on a network call (rare but possible
+        during the auth refresh path).
+
+    Returns ``(ok, message)``: ``message`` is the version string on
+    success or a short diagnostic on failure. Caller is expected to
+    log + continue (the bridge stays useful for /health and
+    /auth/verify even when claude isn't invocable, so we never crash
+    the boot).
+    """
+    from config import CLAUDE_BIN_PATH
+
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN_PATH, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        return False, (
+            f"`{CLAUDE_BIN_PATH}` not found on PATH. Set CLAUDE_BIN_PATH "
+            f"in .env to the absolute path that `which claude` returns "
+            f"(common for NVM / nodenv / asdf users)."
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"`{CLAUDE_BIN_PATH} --version` timed out after {timeout_seconds}s"
+    except OSError as err:
+        return False, f"`{CLAUDE_BIN_PATH} --version` failed to spawn: {err}"
+
+    if result.returncode != 0:
+        # Surface stderr where it exists; fall back to stdout because
+        # some `claude` versions print version info to stdout even on
+        # failure (auth-prompt scenario).
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, (
+            f"`{CLAUDE_BIN_PATH} --version` exited with code {result.returncode}: "
+            f"{detail or '<no output>'}"
+        )
+    return True, (result.stdout or "").strip() or "<version unknown>"
+
+
 @dataclass
 class ClaudeResult:
     """Outcome of a blocking claude run. Discriminated by which fields

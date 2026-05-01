@@ -1,0 +1,58 @@
+# Production-ish docker-compose for `another_coder`. For laptop dev
+# use the venv path in the README — Docker is for VPS / home-server
+# deployments where you want one-command install + a persistent
+# session DB without root-installing Python or Node.
+#
+# Required env (put in `.env` next to this file, then `docker compose up`):
+#
+#   ANOTHER_CODER_API_KEY    — generate with
+#       python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   GITHUB_PAT               — for the planning + implementation tools
+#   GITHUB_DEFAULT_REPO      — owner/repo
+#
+# Optional env: see .env.example for the full list (rate-limit specs,
+# reaper tunables, base branch, etc.).
+
+services:
+  another_coder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: another_coder:local
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override the in-container defaults to match the bind mounts
+      # below. WORKSPACE_ROOT points at the mount target; the
+      # session DB lives in the named volume so it survives `docker
+      # compose down` (without the volume, conversation continuity
+      # would reset on every restart — defeats the SQLite migration).
+      WORKSPACE_ROOT: /workspace
+      ANOTHER_CODER_SESSION_DB_PATH: /data/sessions.db
+    volumes:
+      # Your workspace — the parent of every repo Claude Code is
+      # allowed to spawn in. Read-write because Claude Code edits
+      # files. Adjust the host path on the LEFT to your machine.
+      - ${HOST_WORKSPACE:-${HOME}/Projects}:/workspace:rw
+      # claude CLI auth — the containerized `claude` binary inherits
+      # your host's authenticated session so you don't `claude login`
+      # per restart. Read-write because some claude workflows update
+      # cached credentials.
+      - ${HOST_CLAUDE_DIR:-${HOME}/.claude}:/root/.claude:rw
+      # Persistent session DB. Named volume (rather than bind mount)
+      # because the path is internal to the container.
+      - sessions:/data
+    healthcheck:
+      # Hit the unauthed /health endpoint. Cheap, doesn't require
+      # the API key.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  sessions:

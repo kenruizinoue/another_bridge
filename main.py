@@ -9,6 +9,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from auth import verify_api_key
 from config import CLAUDE_MODEL
 from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos
+from services.claude_runner import probe_claude_binary
 from services.rate_limiter import limiter
 from services.reaper import build_default_reaper
 
@@ -28,6 +29,17 @@ log = structlog.get_logger()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     log.info("server.started", model=CLAUDE_MODEL)
+    # Operator UX: probe `claude --version` at boot so a missing /
+    # broken CLI surfaces in the startup log rather than at first
+    # chat (where it would surface as a generic ``spawn_failed``
+    # error_kind). Never crashes the boot — /health and /auth/verify
+    # stay useful regardless, and the operator might fix the CLI
+    # without a restart (e.g. by re-running `claude login`).
+    ok, detail = probe_claude_binary()
+    if ok:
+        log.info("claude.ready", version=detail)
+    else:
+        log.warning("claude.not_invocable", reason=detail)
     reaper = build_default_reaper()
     reaper.start()
     try:

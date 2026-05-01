@@ -22,7 +22,7 @@ When wired up:
   - `Pull requests: Read and write`
   - `Contents: Read and write`
 - **Local clone(s) of your target repo(s)** — at minimum the one you want to demo on.
-- **An AnotherAgent account** with the platform running.
+- **An AnotherAgent account** — sign up at <https://anotheragent.dev>. The frontend + backend are hosted; you don't deploy those yourself. The only thing that runs locally is `another_coder` (this repo), because Claude Code itself runs on your machine with your subscription.
 
 ---
 
@@ -235,8 +235,34 @@ pytest tests/test_chat_security.py -v  # run a focused file
 
 The test suite uses an in-memory SQLite session store (set via `tests/conftest.py` before any module import) and patches `subprocess.Popen` at the seam — no real Claude Code spawns, no GitHub round-trips, no on-disk state pollution.
 
+CI runs the same suite + coverage gate on every PR to `dev` (`.github/workflows/test.yml`). A regression below 70% source coverage fails the build.
+
+---
+
+## Running in Docker (optional — for VPS / home-server deployments)
+
+Laptop users: stick with the venv path above. Docker only earns its keep when you're running the bridge somewhere other than your dev machine — it collapses the install matrix (Python + Node + claude CLI + Python deps) into one `docker compose up`.
+
+```bash
+cp .env.example .env
+# Fill in ANOTHER_CODER_API_KEY + WORKSPACE_ROOT etc.
+
+# Optional overrides (else docker-compose.yml uses your $HOME/Projects + $HOME/.claude):
+export HOST_WORKSPACE=/path/to/your/repos
+export HOST_CLAUDE_DIR=$HOME/.claude
+
+docker compose up --build
+```
+
+Two host directories must be bind-mounted into the container:
+
+- **`$HOME/Projects` → `/workspace`** — Claude Code reads + writes here. Set `WORKSPACE_ROOT=/workspace` in the env so the bounds gate works.
+- **`$HOME/.claude` → `/root/.claude`** — the containerized `claude` binary inherits your host's authenticated session. Without this mount you'd `claude login` inside the container on every restart.
+
+The session DB lives in a named Docker volume (`sessions`) so conversation continuity survives `docker compose down`. See [`docker-compose.yml`](docker-compose.yml) for the full layout + the [`Dockerfile`](Dockerfile) for the build details.
+
 ---
 
 ## License
 
-(Add yours.)
+MIT — see [`LICENSE`](LICENSE). Forks are welcome; if you build something interesting on top of the bridge, a PR back is appreciated but not required.
