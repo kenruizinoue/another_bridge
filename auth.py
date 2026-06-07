@@ -1,4 +1,4 @@
-"""Shared-secret header auth for the another_coder bridge.
+"""Shared-secret header auth for the another_bridge service.
 
 Single header (`X-Coder-Key`) checked against `ANOTHER_CODER_API_KEY` from the
 process environment via constant-time compare. Applied router-level on

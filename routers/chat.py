@@ -226,7 +226,7 @@ def chat_stream(request: Request, req: ChatStreamRequest):
         # before any text flows. We send relative URLs — the platform
         # already knows the coder host from agent.llmConfig.coderUrl /
         # app.coderUrl, so baking the absolute URL here would just couple
-        # another_coder to its public-facing host. Field names (camelCase)
+        # another_bridge to its public-facing host. Field names (camelCase)
         # match the async-webhook contract the platform already speaks.
         #
         # statusUrl + poll seconds are the polling primitives — when the

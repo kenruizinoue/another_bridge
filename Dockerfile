@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# another_coder bridge — production-ish Docker image.
+# another_bridge bridge — production-ish Docker image.
 #
 # Why this exists: Docker isn't the recommended path for a laptop
 # demo (just `python -m venv` + `pip install`), but for users
@@ -29,7 +29,7 @@
 #       -v "$HOME/your-repos:/workspace:rw" \
 #       -v "$HOME/.claude:/root/.claude:rw" \
 #       --env-file .env \
-#       another_coder
+#       another_bridge
 
 # ── Stage 1: install claude CLI from npm ──────────────────────────────
 # Multi-stage so we don't drag npm + the rest of the Node toolchain

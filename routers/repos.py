@@ -151,7 +151,7 @@ async def list_repos(request: Request) -> dict[str, Any]:
     if not WORKSPACE_ROOT:
         return {
             "error": (
-                "WORKSPACE_ROOT not configured in another_coder/.env. "
+                "WORKSPACE_ROOT not configured in another_bridge/.env. "
                 "Set WORKSPACE_ROOT to the parent directory containing your "
                 "git repos so the agent can enumerate and target them."
             )

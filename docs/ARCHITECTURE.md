@@ -1,6 +1,6 @@
 # Architecture
 
-This document covers what `another_coder` actually does at runtime: the
+This document covers what `another_bridge` actually does at runtime: the
 two main flows (claude_code engine bridge + webhook tools), the
 polling-reconnect path, the persistence model, the lifecycle of the
 TTL reaper, and the security model.
@@ -25,7 +25,7 @@ graph TB
         Ngrok[ngrok HTTPS tunnel]
     end
 
-    subgraph Coder[another_coder]
+    subgraph Coder[another_bridge]
         ChatStream[POST /chat/stream<br/>SSE]
         Webhooks["POST /tools/instruct_*<br/>POST /tools/github_*<br/>POST /tools/list_repos"]
         Jobs[GET /jobs/&lt;id&gt;/status<br/>GET /jobs/&lt;id&gt;/chat/status<br/>POST /jobs/&lt;id&gt;/cancel]
@@ -83,7 +83,7 @@ sequenceDiagram
     actor User
     participant Frontend as Frontend (web/mobile)
     participant Backend as Platform Backend
-    participant Bridge as another_coder /chat/stream
+    participant Bridge as another_bridge /chat/stream
     participant Store as session_store (SQLite)
     participant Mgr as JobManager
     participant Claude as claude CLI
@@ -136,7 +136,7 @@ sequenceDiagram
     participant Frontend
     participant Backend
     participant BridgeStatus as backend /conversations/:id/bridge-status
-    participant Coder as another_coder /jobs/:id/chat/status
+    participant Coder as another_bridge /jobs/:id/chat/status
 
     Note over User,Frontend: 📱 lock phone — SSE dies
     User->>Frontend: 📱 unlock
@@ -172,7 +172,7 @@ back immediately, then polls `/jobs/<id>/status` until done.
 sequenceDiagram
     autonumber
     participant Platform as Platform executeTool dispatcher
-    participant Coder as another_coder /tools/instruct_implementation
+    participant Coder as another_bridge /tools/instruct_implementation
     participant Schema as ImplementationRequest<br/>(pydantic)
     participant Repo as Local repo (validated cwd)
     participant Claude as claude CLI

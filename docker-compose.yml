@@ -1,4 +1,4 @@
-# Production-ish docker-compose for `another_coder`. For laptop dev
+# Production-ish docker-compose for `another_bridge`. For laptop dev
 # use the venv path in the README — Docker is for VPS / home-server
 # deployments where you want one-command install + a persistent
 # session DB without root-installing Python or Node.
@@ -14,11 +14,11 @@
 # reaper tunables, base branch, etc.).
 
 services:
-  another_coder:
+  another_bridge:
     build:
       context: .
       dockerfile: Dockerfile
-    image: another_coder:local
+    image: another_bridge:local
     restart: unless-stopped
     ports:
       - "8000:8000"

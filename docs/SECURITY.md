@@ -1,7 +1,7 @@
 # Security Model
 
 This document is the "should I install this on my main laptop" decision
-doc. It describes what trust boundary `another_coder` actually defends,
+doc. It describes what trust boundary `another_bridge` actually defends,
 what it doesn't, and how to harden a deployment.
 
 If you're just looking for the operator's how-to, start at the
@@ -13,7 +13,7 @@ complement to those.
 
 ## TL;DR
 
-`another_coder` runs `claude --dangerously-skip-permissions` as a
+`another_bridge` runs `claude --dangerously-skip-permissions` as a
 subprocess on your machine and exposes an HTTP surface to the AnotherAgent
 platform via ngrok. With the right configuration the bridge bounds:
 
@@ -213,7 +213,7 @@ For a single-operator demo / personal-productivity use:
 For something closer to "left running for days":
 
 ```
-+ Run as a dedicated non-admin user (sudo adduser another_coder; ...)
++ Run as a dedicated non-admin user (sudo adduser another_bridge; ...)
 + Use ngrok's reserved-domain feature so the URL is stable across
   restarts (so you don't accidentally publish a fresh URL into a Slack
   while debugging)
@@ -234,7 +234,7 @@ For something closer to "left running for days":
 # 1. Generate a new token
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 
-# 2. Update another_coder/.env
+# 2. Update another_bridge/.env
 #    ANOTHER_CODER_API_KEY=<new-token>
 
 # 3. Restart uvicorn

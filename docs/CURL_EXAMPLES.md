@@ -22,7 +22,7 @@ curl "$CODER_URL/health"
 ```json
 {
   "ok": true,
-  "service": "another_coder",
+  "service": "another_bridge",
   "version": "0.1.0",
   "claude_probe": {"ok": true, "detail": "claude-code 1.x.y"},
   "session_store_reachable": true

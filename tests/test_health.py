@@ -43,7 +43,7 @@ class TestHealth:
         assert resp.status_code == 200
         body = resp.json()
         assert body["ok"] is True
-        assert body["service"] == "another_coder"
+        assert body["service"] == "another_bridge"
         # Don't pin the literal — pyproject.toml is the source of
         # truth and this test should keep passing across bumps.
         assert isinstance(body["version"], str)
@@ -55,7 +55,7 @@ class TestHealth:
         # must stay 200 — uptime monitors don't tolerate flapping.
         with patch(
             "routers.health._pkg_version",
-            side_effect=PackageNotFoundError("another_coder"),
+            side_effect=PackageNotFoundError("another_bridge"),
         ):
             resp = _build_client().get("/health")
         assert resp.status_code == 200

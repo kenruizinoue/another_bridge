@@ -16,7 +16,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "another_coder"
+name = "another_bridge"
 # Bumped on each release. Surfaced in /health so bug reports include
 # the version automatically. Single source of truth — main.py reads
 # it via importlib.metadata so we don't drift between the package
@@ -72,10 +72,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kenruizinoue/another_coder"
-Documentation = "https://github.com/kenruizinoue/another_coder/blob/dev/docs/ARCHITECTURE.md"
-Repository = "https://github.com/kenruizinoue/another_coder"
-Issues = "https://github.com/kenruizinoue/another_coder/issues"
+Homepage = "https://github.com/kenruizinoue/another_bridge"
+Documentation = "https://github.com/kenruizinoue/another_bridge/blob/dev/docs/ARCHITECTURE.md"
+Repository = "https://github.com/kenruizinoue/another_bridge"
+Issues = "https://github.com/kenruizinoue/another_bridge/issues"
 
 # Single-app layout: main.py + auth.py + config.py + jobs.py at the
 # repo root, routers/ + services/ as packages. setuptools needs the

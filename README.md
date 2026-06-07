@@ -1,4 +1,6 @@
-# another_coder
+# another_bridge
+
+> ⚠️ **Beta — use at your own risk.** Runs `claude --dangerously-skip-permissions` against a directory you choose. Set `WORKSPACE_ROOT` to a path you'd be OK losing, and never expose the bridge's API key in screenshots, recordings, or LLM prompts. Threat model: [`docs/SECURITY.md`](docs/SECURITY.md).
 
 FastAPI bridge that lets the AnotherAgent platform run **Claude Code** on your machine. Two surfaces:
 
@@ -22,7 +24,7 @@ When wired up:
   - `Pull requests: Read and write`
   - `Contents: Read and write`
 - **Local clone(s) of your target repo(s)** — at minimum the one you want to demo on.
-- **An AnotherAgent account** — sign up at <https://anotheragent.dev>. The frontend + backend are hosted; you don't deploy those yourself. The only thing that runs locally is `another_coder` (this repo), because Claude Code itself runs on your machine with your subscription.
+- **An AnotherAgent account** — sign up at <https://anotheragent.dev>. The frontend + backend are hosted; you don't deploy those yourself. The only thing that runs locally is `another_bridge` (this repo), because Claude Code itself runs on your machine with your subscription.
 
 ---
 
@@ -31,8 +33,8 @@ When wired up:
 ### 1. Clone + install
 
 ```bash
-git clone <this-repo-url> another_coder
-cd another_coder
+git clone <this-repo-url> another_bridge
+cd another_bridge
 python3 -m venv .venv && source .venv/bin/activate
 pip install .
 ```
@@ -101,7 +103,7 @@ Verify in another terminal:
 
 ```bash
 curl http://127.0.0.1:8000/health
-# {"ok":true,"service":"another_coder","version":"0.1.0",
+# {"ok":true,"service":"another_bridge","version":"0.1.0",
 #  "claude_probe":{"ok":true,"detail":"claude-code 1.x.y"},
 #  "session_store_reachable":true}
 ```
@@ -257,7 +259,7 @@ docker compose up --build
 Two host directories are bind-mounted into the container:
 
 - **`WORKSPACE_ROOT` (1:1)** — read straight from `.env` and mounted at the same path inside the container, so `WORKSPACE_ROOT` is the source of truth in both venv and Docker deployments. Whatever path the platform sends as `repo_path` resolves identically in both — no translation.
-- **`$HOME/.claude` → `/root/.claude`** + **`$HOME/.claude.json` → `/root/.claude.json`** — Claude's auth state lives in TWO host locations: a directory (caches, projects) and a top-level config file (session token). Both are mounted so the containerized binary inherits your host's authenticated session and you don't `claude login` per restart. Override with `HOST_CLAUDE_DIR` / `HOST_CLAUDE_CONFIG` if your CLI auth lives elsewhere. **First-time Docker users:** if you've never run `claude` on this host, both files are missing — Docker auto-creates them as empty dirs (wrong type) and the container errors. Run `claude login` once on host **OR** `touch ~/.claude.json && mkdir -p ~/.claude` before `docker compose up`, then run `docker compose run --rm another_coder claude login` for the actual auth.
+- **`$HOME/.claude` → `/root/.claude`** + **`$HOME/.claude.json` → `/root/.claude.json`** — Claude's auth state lives in TWO host locations: a directory (caches, projects) and a top-level config file (session token). Both are mounted so the containerized binary inherits your host's authenticated session and you don't `claude login` per restart. Override with `HOST_CLAUDE_DIR` / `HOST_CLAUDE_CONFIG` if your CLI auth lives elsewhere. **First-time Docker users:** if you've never run `claude` on this host, both files are missing — Docker auto-creates them as empty dirs (wrong type) and the container errors. Run `claude login` once on host **OR** `touch ~/.claude.json && mkdir -p ~/.claude` before `docker compose up`, then run `docker compose run --rm another_bridge claude login` for the actual auth.
 
 The session DB lives in a named Docker volume (`sessions`) so conversation continuity survives `docker compose down`. See [`docker-compose.yml`](docker-compose.yml) for the full layout + the [`Dockerfile`](Dockerfile) for the build details.
 
@@ -268,7 +270,7 @@ Even with Docker handling Python + Node, the `claude` CLI still needs to log in 
 The fix is a one-time login *inside* the container:
 
 ```bash
-docker compose run --rm another_coder claude login
+docker compose run --rm another_bridge claude login
 ```
 
 (The `--rm` flag auto-deletes the one-shot container after the command exits — the auth token persists via the bind mount, so the container itself isn't worth keeping.)

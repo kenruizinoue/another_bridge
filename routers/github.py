@@ -28,7 +28,7 @@ async def github_search_issues(request: Request) -> dict[str, Any]:
 
     if not GITHUB_PAT:
         log.error("github_search_issues.missing_pat")
-        return {"error": "GITHUB_PAT not configured in another_coder/.env"}
+        return {"error": "GITHUB_PAT not configured in another_bridge/.env"}
     if not repo:
         log.error("github_search_issues.missing_repo")
         return {"error": "repo not provided and GITHUB_DEFAULT_REPO not configured"}
@@ -57,7 +57,7 @@ async def github_get_issue(request: Request) -> dict[str, Any]:
 
     if not GITHUB_PAT:
         log.error("github_get_issue.missing_pat")
-        return {"error": "GITHUB_PAT not configured in another_coder/.env"}
+        return {"error": "GITHUB_PAT not configured in another_bridge/.env"}
     if not repo:
         log.error("github_get_issue.missing_repo")
         return {"error": "repo not provided and GITHUB_DEFAULT_REPO not configured"}

@@ -14,7 +14,7 @@ def _project_version() -> str:
     # Falls back to "unknown" when the bridge runs from a clone
     # without `pip install` (uptime checks must not 500).
     try:
-        return _pkg_version("another_coder")
+        return _pkg_version("another_bridge")
     except PackageNotFoundError:
         return "unknown"
 
@@ -31,7 +31,7 @@ def health(request: Request):
     probe = getattr(request.app.state, "claude_probe", None) or _PROBE_NOT_RUN
     return {
         "ok": True,
-        "service": "another_coder",
+        "service": "another_bridge",
         "version": _project_version(),
         "claude_probe": probe,
         "session_store_reachable": session_store.is_reachable(),
