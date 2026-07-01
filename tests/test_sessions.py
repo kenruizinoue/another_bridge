@@ -404,6 +404,63 @@ class TestResume:
     def test_resume_stream_unknown_session_404(self, client: TestClient) -> None:
         assert client.post("/sessions/nope/resume/stream", json={"message": "hi"}).status_code == 404
 
+    def test_resume_stream_with_image_uses_stdin(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import contextlib
+
+        captured: dict = {}
+        lines = [
+            json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "red"}}}),
+            json.dumps({"type": "result"}),
+        ]
+
+        class FakeProc:
+            stdout = [f"{l}\n" for l in lines]
+
+        @contextlib.contextmanager
+        def fake_stdin(args, cwd, job_id, stdin_data):
+            captured["args"] = args
+            captured["stdin"] = stdin_data
+            yield FakeProc()
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess_stdin", fake_stdin)
+
+        with client.stream(
+            "POST",
+            "/sessions/sess-1/resume/stream",
+            json={"message": "color?", "images": [{"media_type": "image/png", "data": "QUJD"}]},
+        ) as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
+
+        # routed through the stdin path with a stream-json image message
+        assert "--input-format" in captured["args"] and "stream-json" in captured["args"]
+        assert '"type": "image"' in captured["stdin"] and '"QUJD"' in captured["stdin"]
+        assert "event: text" in body
+
+    def test_resume_image_only_is_allowed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A message with no text but an image must NOT be rejected as empty.
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_stdin(args, cwd, job_id, stdin_data):
+            class P:
+                stdout = ['{"type":"result"}\n']
+
+            yield P()
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess_stdin", fake_stdin)
+        with client.stream(
+            "POST",
+            "/sessions/sess-1/resume/stream",
+            json={"images": [{"media_type": "image/jpeg", "data": "QUJD"}]},
+        ) as r:
+            assert r.status_code == 200
+            "".join(r.iter_text())
+
     def test_queue_drains_in_order(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
         import time as _t
 

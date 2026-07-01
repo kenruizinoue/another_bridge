@@ -23,6 +23,7 @@ than poking subprocess directly — keeps callers' subprocess use opaque.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -191,6 +192,55 @@ def run_blocking(
     )
 
 
+def run_blocking_stdin(
+    args: list[str],
+    cwd: str,
+    timeout_seconds: int,
+    job_id: str,
+    stdin_data: str,
+) -> ClaudeResult:
+    """run_blocking that also feeds ``stdin_data`` (for --input-format
+    stream-json image messages in the queue worker)."""
+    started = time.time()
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            start_new_session=True,
+        )
+    except FileNotFoundError as err:
+        return ClaudeResult(
+            returncode=-1, stdout="", stderr="", timed_out=False, cancelled=False,
+            duration_seconds=round(time.time() - started, 2),
+            spawn_error=f"failed to spawn claude: {err}",
+        )
+
+    job_manager.attach_process(job_id, proc)
+    timed_out = False
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            timed_out = True
+    finally:
+        job_manager.detach_process(job_id)
+
+    return ClaudeResult(
+        returncode=proc.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        timed_out=timed_out,
+        cancelled=job_manager.is_cancelled(job_id),
+        duration_seconds=round(time.time() - started, 2),
+    )
+
+
 @contextmanager
 def streaming_subprocess(
     args: list[str],
@@ -218,6 +268,70 @@ def streaming_subprocess(
         start_new_session=True,
     )
     job_manager.attach_process(job_id, proc)
+    try:
+        yield proc
+    finally:
+        job_manager.detach_process(job_id)
+
+
+def build_claude_stdin_args(
+    model: str,
+    output_format: str = "stream-json",
+    extra_flags: list[str] | None = None,
+) -> list[str]:
+    """Args for feeding a message via ``--input-format stream-json`` on
+    stdin (used for image content blocks, which can't go on the CLI). No
+    positional prompt — the message JSON is written to the process's
+    stdin. Mirrors build_claude_args otherwise (skip-permissions, model)."""
+    from config import CLAUDE_BIN_PATH
+
+    args = [
+        CLAUDE_BIN_PATH,
+        "-p",
+        "--model",
+        model,
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        output_format,
+        "--dangerously-skip-permissions",
+    ]
+    if extra_flags:
+        args.extend(extra_flags)
+    return args
+
+
+@contextmanager
+def streaming_subprocess_stdin(
+    args: list[str],
+    cwd: str,
+    job_id: str,
+    stdin_data: str,
+) -> Iterator[subprocess.Popen]:
+    """Like streaming_subprocess but also writes ``stdin_data`` to the
+    process (for --input-format stream-json). The write runs on a thread
+    so a large payload (base64 images) can't deadlock against our reading
+    of stdout when it exceeds the OS pipe buffer."""
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    job_manager.attach_process(job_id, proc)
+
+    def _feed() -> None:
+        try:
+            proc.stdin.write(stdin_data)
+            proc.stdin.close()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+
+    threading.Thread(target=_feed, daemon=True).start()
     try:
         yield proc
     finally:

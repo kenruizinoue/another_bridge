@@ -54,11 +54,34 @@ log = structlog.get_logger()
 router = APIRouter()
 
 
-class ResumeRequest(BaseModel):
-    """Body for continuing a session from mobile: one user message that
-    gets appended to the transcript via ``claude --resume <id>``."""
+class ImageAttachment(BaseModel):
+    """A base64 image the phone attached to a message (raw base64, no
+    ``data:`` prefix)."""
 
-    message: str = Field(min_length=1, max_length=100_000)
+    media_type: str = Field(pattern=r"^image/(png|jpeg|jpg|webp|gif)$")
+    data: str = Field(min_length=1)
+
+
+class ResumeRequest(BaseModel):
+    """Body for continuing a session from mobile: a user message and/or up
+    to 10 attached images, appended to the transcript via
+    ``claude --resume <id>``. Either the message or images must be present."""
+
+    message: str = Field(default="", max_length=100_000)
+    images: list[ImageAttachment] = Field(default_factory=list, max_length=10)
+
+
+def _stdin_message(message: str, images: list[ImageAttachment]) -> str:
+    """A stream-json user message (text + image content blocks) for
+    ``--input-format stream-json`` on claude's stdin."""
+    content: list[dict] = []
+    if message:
+        content.append({"type": "text", "text": message})
+    for img in images:
+        content.append(
+            {"type": "image", "source": {"type": "base64", "media_type": img.media_type, "data": img.data}}
+        )
+    return json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
 
 
 # In-flight resume tracking, keyed by session id (value = start time).
@@ -98,14 +121,19 @@ def _resume_started_at(session_id: str) -> float | None:
 # the session to be free, then runs the next message with
 # `claude --resume` (blocking) and repeats. The client just polls status
 # and pulls the transcript when it comes back.
-_queues: dict[str, list[str]] = {}
+# Queue items are {"message": str, "images": list[ImageAttachment]}.
+_queues: dict[str, list[dict]] = {}
 _workers: set[str] = set()
 _queue_guard = threading.Lock()
 
 
 def _queued(session_id: str) -> list[str]:
+    """Message previews for status (image-only turns show a marker)."""
     with _queue_guard:
-        return list(_queues.get(session_id, ()))
+        return [
+            (it["message"] or f"📎 {len(it['images'])} image(s)")
+            for it in _queues.get(session_id, ())
+        ]
 
 
 def _drain_queue(session_id: str, cwd: str) -> None:
@@ -128,35 +156,44 @@ def _drain_queue(session_id: str, cwd: str) -> None:
 
         with _queue_guard:
             pending = _queues.get(session_id) or []
-            message = pending.pop(0) if pending else None
-        if message is None:
+            item = pending.pop(0) if pending else None
+        if item is None:
             _end_resume(session_id)
             continue
 
         try:
             model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
-            args = claude_runner.build_claude_args(
-                prompt=message,
-                model=model,
-                output_format="json",
-                extra_flags=["--resume", session_id],
-            )
             job = job_manager.create(kind="resume_queue")
             log.info("resume_queue.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
-            claude_runner.run_blocking(
-                args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
-            )
+            if item["images"]:
+                # Images can't go on the CLI — feed via stream-json stdin.
+                args = claude_runner.build_claude_stdin_args(
+                    model=model, output_format="stream-json",
+                    extra_flags=["--verbose", "--resume", session_id],
+                )
+                claude_runner.run_blocking_stdin(
+                    args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
+                    job_id=job.job_id, stdin_data=_stdin_message(item["message"], item["images"]),
+                )
+            else:
+                args = claude_runner.build_claude_args(
+                    prompt=item["message"], model=model, output_format="json",
+                    extra_flags=["--resume", session_id],
+                )
+                claude_runner.run_blocking(
+                    args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
+                )
         except Exception as err:  # a bad turn must not kill the worker
             log.error("resume_queue.failed", session_id=session_id, error=str(err))
         finally:
             _end_resume(session_id)
 
 
-def _enqueue(session_id: str, cwd: str, message: str) -> int:
-    """Append a message and ensure a drain worker is running. Returns the
-    new queue depth."""
+def _enqueue(session_id: str, cwd: str, message: str, images: list) -> int:
+    """Append a message (+ images) and ensure a drain worker is running.
+    Returns the new queue depth."""
     with _queue_guard:
-        _queues.setdefault(session_id, []).append(message)
+        _queues.setdefault(session_id, []).append({"message": message, "images": images})
         depth = len(_queues[session_id])
         start_worker = session_id not in _workers
         if start_worker:
@@ -167,16 +204,25 @@ def _enqueue(session_id: str, cwd: str, message: str) -> int:
 
 
 def _extract_reply(stdout: str) -> str:
-    """Pull the assistant's final text out of ``--output-format json``
-    (a single result object). Returns '' if the shape is unexpected —
-    the client re-fetches the transcript for the canonical turns anyway."""
+    """Assistant's final text from claude's output. Handles both
+    ``--output-format json`` (one result object) and ``stream-json`` (the
+    image path, where we scan for the result line). '' if unexpected — the
+    client re-fetches the transcript for the canonical turns anyway."""
     try:
         data = json.loads(stdout)
+        if isinstance(data, dict):
+            return data.get("result") or ""
     except (ValueError, TypeError):
-        return ""
-    if isinstance(data, dict):
-        return data.get("result") or ""
-    return ""
+        pass
+    reply = ""
+    for line in stdout.splitlines():
+        try:
+            evt = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(evt, dict) and evt.get("type") == "result":
+            reply = evt.get("result") or reply
+    return reply
 
 
 @router.get("/sessions")
@@ -250,24 +296,30 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
     # in-tab sync). That's an accepted tradeoff for the mobile-continue flow.
 
     message = body.message.strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="message must not be empty")
+    if not message and not body.images:
+        raise HTTPException(status_code=422, detail="message or images required")
 
     if not _try_start_resume(session_id):
         raise HTTPException(status_code=409, detail="this session is already processing a message")
     try:
         model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
-        args = claude_runner.build_claude_args(
-            prompt=message,
-            model=model,
-            output_format="json",
-            extra_flags=["--resume", session_id],
-        )
         job = job_manager.create(kind="resume_session")
         log.info("resume_session.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
-        result = claude_runner.run_blocking(
-            args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
-        )
+        if body.images:
+            args = claude_runner.build_claude_stdin_args(
+                model=model, output_format="stream-json", extra_flags=["--verbose", "--resume", session_id]
+            )
+            result = claude_runner.run_blocking_stdin(
+                args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
+                job_id=job.job_id, stdin_data=_stdin_message(message, body.images),
+            )
+        else:
+            args = claude_runner.build_claude_args(
+                prompt=message, model=model, output_format="json", extra_flags=["--resume", session_id]
+            )
+            result = claude_runner.run_blocking(
+                args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
+            )
 
         if result.spawn_error:
             raise HTTPException(status_code=500, detail=f"could not spawn claude: {result.spawn_error}")
@@ -308,8 +360,9 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
     if not cwd:
         raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
     message = body.message.strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="message must not be empty")
+    images = body.images
+    if not message and not images:
+        raise HTTPException(status_code=422, detail="message or images required")
 
     def gen() -> Iterator[str]:
         if not _try_start_resume(session_id):
@@ -318,16 +371,27 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
         spawned = False
         try:
             model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
-            args = claude_runner.build_claude_args(
-                prompt=message,
-                model=model,
-                output_format="stream-json",
-                extra_flags=["--verbose", "--include-partial-messages", "--resume", session_id],
-            )
             job = job_manager.create(kind="resume_session_stream")
             log.info("resume_stream.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
+            # Images can't ride the CLI — feed the message as a stream-json
+            # user turn (text + image blocks) on stdin. Text-only stays on
+            # the -p positional (cheaper, unchanged).
+            if images:
+                args = claude_runner.build_claude_stdin_args(
+                    model=model, output_format="stream-json",
+                    extra_flags=["--verbose", "--include-partial-messages", "--resume", session_id],
+                )
+                ctx = claude_runner.streaming_subprocess_stdin(
+                    args, cwd=cwd, job_id=job.job_id, stdin_data=_stdin_message(message, images)
+                )
+            else:
+                args = claude_runner.build_claude_args(
+                    prompt=message, model=model, output_format="stream-json",
+                    extra_flags=["--verbose", "--include-partial-messages", "--resume", session_id],
+                )
+                ctx = claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job.job_id)
             try:
-                with claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job.job_id) as proc:
+                with ctx as proc:
                     # Read claude's stdout on a thread into a queue so the
                     # generator can emit an SSE heartbeat during the long
                     # SILENT phase (resuming a big session loads/replays the
@@ -405,10 +469,10 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
     if not cwd:
         raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
     message = body.message.strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="message must not be empty")
+    if not message and not body.images:
+        raise HTTPException(status_code=422, detail="message or images required")
 
-    depth = _enqueue(session_id, cwd, message)
+    depth = _enqueue(session_id, cwd, message, body.images)
     return {"ok": True, "session_id": session_id, "queued": depth}
 
 
