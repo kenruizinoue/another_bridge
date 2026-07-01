@@ -173,10 +173,10 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
                 elif etype == "summary" and not summary:
                     summary = event.get("summary")
                 elif etype == "user":
-                    # Sidechain = subagent transcript; isMeta = injected
-                    # image/caveat metadata. Neither is a human turn, so
-                    # both are excluded from the count and the title.
-                    if event.get("isSidechain") or event.get("isMeta"):
+                    # Sidechain (subagent), isMeta (injected image/caveat),
+                    # and isCompactSummary (auto-compaction block) are not
+                    # human turns — excluded from the count and the title.
+                    if event.get("isSidechain") or event.get("isMeta") or event.get("isCompactSummary"):
                         continue
                     message_count += 1
                     if first_user_text is None:
@@ -328,12 +328,18 @@ def _parse_turns(path: Path) -> list[Turn]:
                     event = json.loads(line)
                 except (ValueError, TypeError):
                     continue
-                # isMeta = harness-injected metadata, NOT a human turn:
-                # image descriptors from pasted/read screenshots
-                # ("[Image: original …, Multiply coordinates by …]"),
-                # caveats, command output. These carry text, so without
-                # this guard they render as bogus "you" turns.
-                if not isinstance(event, dict) or event.get("isSidechain") or event.get("isMeta"):
+                # Skip non-human turns:
+                #  - isSidechain: subagent transcripts
+                #  - isMeta: harness-injected image descriptors / caveats
+                #  - isCompactSummary: Claude Code's auto-compaction block
+                #    ("This session is being continued … Summary: …"),
+                #    which is internal context, not a message you sent.
+                if (
+                    not isinstance(event, dict)
+                    or event.get("isSidechain")
+                    or event.get("isMeta")
+                    or event.get("isCompactSummary")
+                ):
                     continue
 
                 etype = event.get("type")

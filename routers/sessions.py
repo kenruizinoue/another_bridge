@@ -13,7 +13,9 @@ per-route slowapi limit keyed on the shared X-Coder-Key.
 """
 
 import json
+import queue
 import threading
+import time
 from typing import Any, Iterator
 
 import structlog
@@ -59,22 +61,109 @@ class ResumeRequest(BaseModel):
     message: str = Field(min_length=1, max_length=100_000)
 
 
-# One lock per session id: a resume APPENDS to the transcript, so two
-# concurrent resumes of the same session would interleave writes. We
-# reject the second with 409 rather than queue it. The terminal running
-# the same session is a separate process we can't lock from here — that
-# stays the user's responsibility (documented: one owner at a time).
-_resume_locks: dict[str, threading.Lock] = {}
-_resume_locks_guard = threading.Lock()
+# In-flight resume tracking, keyed by session id (value = start time).
+# A resume APPENDS to the transcript, so two concurrent resumes would
+# interleave writes — we reject the second (409). Crucially the entry is
+# cleared when the claude PROCESS exits, NOT when the HTTP request ends,
+# so it survives a client disconnect: a dropped mobile client can poll
+# GET /sessions/{id}/resume/status to learn the turn is still running and
+# catch up from the transcript. This is the bridge's "activeExecution".
+_running_resumes: dict[str, float] = {}
+_running_guard = threading.Lock()
 
 
-def _lock_for(session_id: str) -> threading.Lock:
-    with _resume_locks_guard:
-        lock = _resume_locks.get(session_id)
-        if lock is None:
-            lock = threading.Lock()
-            _resume_locks[session_id] = lock
-        return lock
+def _try_start_resume(session_id: str) -> bool:
+    """Atomically mark a resume as running; False if one already is."""
+    with _running_guard:
+        if session_id in _running_resumes:
+            return False
+        _running_resumes[session_id] = time.time()
+        return True
+
+
+def _end_resume(session_id: str) -> None:
+    with _running_guard:
+        _running_resumes.pop(session_id, None)
+
+
+def _resume_started_at(session_id: str) -> float | None:
+    with _running_guard:
+        return _running_resumes.get(session_id)
+
+
+# ── Server-side send queue ────────────────────────────────────────────
+# Messages sent while a turn is in flight are queued HERE (not on the
+# phone), so the conversation keeps advancing even if the app is locked
+# or killed. A per-session daemon worker drains the queue: it waits for
+# the session to be free, then runs the next message with
+# `claude --resume` (blocking) and repeats. The client just polls status
+# and pulls the transcript when it comes back.
+_queues: dict[str, list[str]] = {}
+_workers: set[str] = set()
+_queue_guard = threading.Lock()
+
+
+def _queued(session_id: str) -> list[str]:
+    with _queue_guard:
+        return list(_queues.get(session_id, ()))
+
+
+def _drain_queue(session_id: str, cwd: str) -> None:
+    """Process a session's queued messages one at a time, in order. Runs
+    on its own daemon thread so it outlives the enqueue request."""
+    while True:
+        # Deregister atomically with the empty check so a concurrent
+        # enqueue either sees us still registered (and we'll loop back to
+        # process its message) or starts a fresh worker.
+        with _queue_guard:
+            if not _queues.get(session_id):
+                _queues.pop(session_id, None)
+                _workers.discard(session_id)
+                return
+
+        # Wait until the session is free (a live stream or a prior queued
+        # run holds the slot). _try_start_resume claims it atomically.
+        while not _try_start_resume(session_id):
+            time.sleep(0.3)
+
+        with _queue_guard:
+            pending = _queues.get(session_id) or []
+            message = pending.pop(0) if pending else None
+        if message is None:
+            _end_resume(session_id)
+            continue
+
+        try:
+            model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
+            args = claude_runner.build_claude_args(
+                prompt=message,
+                model=model,
+                output_format="json",
+                extra_flags=["--resume", session_id],
+            )
+            job = job_manager.create(kind="resume_queue")
+            log.info("resume_queue.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
+            claude_runner.run_blocking(
+                args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
+            )
+        except Exception as err:  # a bad turn must not kill the worker
+            log.error("resume_queue.failed", session_id=session_id, error=str(err))
+        finally:
+            _end_resume(session_id)
+
+
+def _enqueue(session_id: str, cwd: str, message: str) -> int:
+    """Append a message and ensure a drain worker is running. Returns the
+    new queue depth."""
+    with _queue_guard:
+        _queues.setdefault(session_id, []).append(message)
+        depth = len(_queues[session_id])
+        start_worker = session_id not in _workers
+        if start_worker:
+            _workers.add(session_id)
+    if start_worker:
+        threading.Thread(target=_drain_queue, args=(session_id, cwd), daemon=True).start()
+    return depth
 
 
 def _extract_reply(stdout: str) -> str:
@@ -164,8 +253,7 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
     if not message:
         raise HTTPException(status_code=422, detail="message must not be empty")
 
-    lock = _lock_for(session_id)
-    if not lock.acquire(blocking=False):
+    if not _try_start_resume(session_id):
         raise HTTPException(status_code=409, detail="this session is already processing a message")
     try:
         model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
@@ -195,7 +283,7 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
 
         return {"ok": True, "session_id": session_id, "reply": _extract_reply(result.stdout)}
     finally:
-        lock.release()
+        _end_resume(session_id)
 
 
 @router.post("/sessions/{session_id}/resume/stream")
@@ -224,10 +312,10 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
         raise HTTPException(status_code=422, detail="message must not be empty")
 
     def gen() -> Iterator[str]:
-        lock = _lock_for(session_id)
-        if not lock.acquire(blocking=False):
+        if not _try_start_resume(session_id):
             yield _sse("error", {"message": "this session is already processing a message"})
             return
+        spawned = False
         try:
             model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
             args = claude_runner.build_claude_args(
@@ -240,7 +328,37 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
             log.info("resume_stream.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
             try:
                 with claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job.job_id) as proc:
-                    for raw in proc.stdout:
+                    # Read claude's stdout on a thread into a queue so the
+                    # generator can emit an SSE heartbeat during the long
+                    # SILENT phase (resuming a big session loads/replays the
+                    # transcript before any token). Without heartbeats an
+                    # idle minutes-long connection gets dropped by cellular
+                    # NAT / ngrok, which the client would misread as "done".
+                    lines: "queue.Queue" = queue.Queue()
+                    STDOUT_EOF = object()
+
+                    def _reader() -> None:
+                        try:
+                            for raw in proc.stdout:
+                                lines.put(raw)
+                        finally:
+                            lines.put(STDOUT_EOF)
+                            # Cleared when CLAUDE exits, not when the HTTP
+                            # request ends — so a disconnected client can
+                            # poll status and see the turn is still running.
+                            _end_resume(session_id)
+
+                    threading.Thread(target=_reader, daemon=True).start()
+                    spawned = True
+
+                    while True:
+                        try:
+                            raw = lines.get(timeout=10)
+                        except queue.Empty:
+                            yield ": keepalive\n\n"  # SSE comment — clients ignore it
+                            continue
+                        if raw is STDOUT_EOF:
+                            break
                         line = raw.strip()
                         if not line:
                             continue
@@ -263,9 +381,54 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
                 return
             yield _sse("done", {"session_id": session_id})
         finally:
-            lock.release()
+            # On the normal / client-disconnect path the reader's finally
+            # clears the marker when claude exits. Only clear here if the
+            # reader never started (early failure / spawn error).
+            if not spawned:
+                _end_resume(session_id)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/sessions/{session_id}/resume/queue")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> dict[str, Any]:
+    """Queue a message to continue the session. Unlike /resume/stream this
+    does NOT block on a live connection — a background worker runs it (and
+    any other queued messages, in order) even if the phone locks or the app
+    is killed. The client polls /resume/status and pulls the transcript on
+    return. Returns the new queue depth."""
+    card = session_index.get_card(session_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    cwd = card.get("cwd")
+    if not cwd:
+        raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="message must not be empty")
+
+    depth = _enqueue(session_id, cwd, message)
+    return {"ok": True, "session_id": session_id, "queued": depth}
+
+
+@router.get("/sessions/{session_id}/resume/status")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def resume_status(request: Request, session_id: str) -> dict[str, Any]:
+    """In-flight state for the mobile client's catch-up loop (the bridge's
+    ``activeExecution``). ``running`` = a turn is generating now; ``queued``
+    = messages waiting to run. The client stays in "busy/syncing" and keeps
+    pulling the transcript while ``running or queued``; when BOTH are empty
+    the conversation has fully advanced. Cheap in-memory read — safe to
+    poll."""
+    started = _resume_started_at(session_id)
+    queued = _queued(session_id)
+    return {
+        "running": started is not None,
+        "started_at": started,
+        "queued": queued,
+        "queue_count": len(queued),
+    }
 
 
 @router.get("/sessions/{session_id}")

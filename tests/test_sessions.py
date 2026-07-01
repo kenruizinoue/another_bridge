@@ -105,6 +105,18 @@ def client(index: SessionIndex, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _reset_resume_state():
+    # In-flight + queue state are module globals; clear between tests so a
+    # worker or marker can't leak into the next case.
+    yield
+    with sessions_router._running_guard:
+        sessions_router._running_resumes.clear()
+    with sessions_router._queue_guard:
+        sessions_router._queues.clear()
+        sessions_router._workers.clear()
+
+
 # ── Cards ─────────────────────────────────────────────────────────────
 
 
@@ -228,6 +240,21 @@ class TestSessionMessages:
         assert "real question" in user_texts
         assert "hello from mobile" in user_texts  # sdk-sourced mobile msg survives
         assert all("task-notification" not in t and "system-reminder" not in t for t in user_texts)
+
+    def test_compaction_summary_is_not_a_turn(self, tmp_path: Path) -> None:
+        # Claude Code's auto-compaction injects an isCompactSummary user
+        # turn ("This session is being continued …"). It's internal
+        # context, not a human message, so it must not render.
+        events = [
+            {"type": "user", "cwd": CWD, "uuid": "u1", "message": {"role": "user", "content": "real"}},
+            {"type": "user", "uuid": "c1", "isCompactSummary": True, "message": {"role": "user", "content": "This session is being continued from a previous conversation…\nSummary:\n1. …"}},
+            {"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+        ]
+        _write_session(tmp_path, "-Users-dev-proj", "compact-1", events)
+        idx = SessionIndex(projects_dir=tmp_path)
+        texts = [m["text"] for m in idx.get_messages("compact-1")["messages"] if m["role"] == "user"]
+        assert texts == ["real"]
+        assert idx.get_card("compact-1")["message_count"] == 2  # user + assistant, not the summary
 
     def test_ismeta_image_descriptors_are_not_turns(self, tmp_path: Path) -> None:
         # Pasted/read screenshots inject an isMeta user event whose text
@@ -376,6 +403,59 @@ class TestResume:
 
     def test_resume_stream_unknown_session_404(self, client: TestClient) -> None:
         assert client.post("/sessions/nope/resume/stream", json={"message": "hi"}).status_code == 404
+
+    def test_queue_drains_in_order(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time as _t
+
+        from services.claude_runner import ClaudeResult
+
+        ran: list[str] = []
+
+        def fake_run_blocking(args, cwd, timeout_seconds, job_id):
+            ran.append(args[args.index("-p") + 1])  # the prompt
+            return ClaudeResult(
+                returncode=0, stdout='{"result": "ok"}', stderr="",
+                timed_out=False, cancelled=False, duration_seconds=0.0,
+            )
+
+        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", fake_run_blocking)
+
+        assert client.post("/sessions/sess-1/resume/queue", json={"message": "first"}).json()["queued"] >= 1
+        assert client.post("/sessions/sess-1/resume/queue", json={"message": "second"}).json()["ok"] is True
+
+        # queue is visible in status while it drains
+        seen_queue = client.get("/sessions/sess-1/resume/status").json()
+        assert "queued" in seen_queue
+
+        for _ in range(60):  # wait up to 6s for the worker to finish both
+            st = client.get("/sessions/sess-1/resume/status").json()
+            if not st["running"] and st["queue_count"] == 0:
+                break
+            _t.sleep(0.1)
+
+        assert ran == ["first", "second"]  # processed in FIFO order
+
+    def test_queue_unknown_session_404(self, client: TestClient) -> None:
+        assert client.post("/sessions/nope/resume/queue", json={"message": "hi"}).status_code == 404
+
+    def test_resume_status_tracks_in_flight(self, client: TestClient) -> None:
+        # The catch-up signal ("activeExecution"): false → true → false.
+        assert client.get("/sessions/sess-1/resume/status").json() == {
+            "running": False,
+            "started_at": None,
+            "queued": [],
+            "queue_count": 0,
+        }
+        assert sessions_router._try_start_resume("sess-1") is True
+        try:
+            body = client.get("/sessions/sess-1/resume/status").json()
+            assert body["running"] is True
+            assert isinstance(body["started_at"], (int, float))
+            # a second start is refused while one is in flight
+            assert sessions_router._try_start_resume("sess-1") is False
+        finally:
+            sessions_router._end_resume("sess-1")
+        assert client.get("/sessions/sess-1/resume/status").json()["running"] is False
 
     def test_resume_spawn_error_500(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
