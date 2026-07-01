@@ -104,6 +104,16 @@ class Settings(BaseSettings):
     another_coder_rate_limit_sessions: str = "120/minute"
 
     # ── Session browsing ───────────────────────────────────────────
+    # Max wall-clock for one mobile "continue this session" turn. The
+    # resume endpoint runs `claude --resume <id> -p <msg>` blocking, so
+    # this bounds how long a single request occupies a worker thread.
+    another_coder_resume_timeout_seconds: int = Field(default=300, ge=1)
+
+    # Model for mobile resume/stream ONLY — kept separate from CLAUDE_MODEL
+    # (the platform bridge's model) so continuing a session from the phone
+    # can use a stronger model without changing the webhook pipeline.
+    another_coder_resume_model: str = "claude-opus-4-8"
+
     # Root that Claude Code writes per-conversation JSONL transcripts
     # under (one <encoded-cwd>/ dir per working directory, one
     # <sessionId>.jsonl per conversation). Empty → resolve at import
@@ -181,3 +191,6 @@ def _resolve_claude_projects_dir() -> Path:
 
 
 CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
+
+ANOTHER_CODER_RESUME_TIMEOUT_SECONDS: int = settings.another_coder_resume_timeout_seconds
+ANOTHER_CODER_RESUME_MODEL: str = settings.another_coder_resume_model

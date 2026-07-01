@@ -27,11 +27,45 @@ belongs in the runner, not the index.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
 from config import CLAUDE_PROJECTS_DIR
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if the process exists. os.kill(pid, 0) raises ProcessLookupError
+    when it's gone and PermissionError when it exists but isn't ours."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
+def is_session_live(session_id: str) -> bool:
+    """True if a Claude Code process currently owns this session. Claude
+    tracks running sessions in ``<claude-config>/sessions/*.json`` (pid +
+    sessionId). Resuming a session that a terminal still has open would
+    mean two processes appending to one transcript, so the resume endpoint
+    uses this to refuse (409) rather than corrupt the file."""
+    sessions_dir = CLAUDE_PROJECTS_DIR.parent / "sessions"
+    if not sessions_dir.exists():
+        return False
+    for f in sessions_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if data.get("sessionId") == session_id:
+            pid = data.get("pid")
+            if isinstance(pid, int) and _pid_alive(pid):
+                return True
+    return False
 
 # Title fallbacks stop at the first line that yields real text. A user
 # turn's content is either a plain string or a list of blocks (text +
@@ -40,7 +74,20 @@ from config import CLAUDE_PROJECTS_DIR
 # Code injects (slash-command expansions, caveats) start with these
 # markers and would make a useless card title.
 _TITLE_MAX = 120
-_SKIP_TEXT_PREFIXES = ("<command-name>", "<command-message>", "Caveat:", "<local-command")
+# Harness-injected user turns that are NOT human messages: slash-command
+# expansions, caveats, local-command output, background task-notifications,
+# and system-reminders. These arrive as user-role turns (some even share
+# promptSource "sdk" with real mobile messages), so we discriminate on the
+# content wrapper rather than promptSource — otherwise mobile turns, which
+# are plain text, would be filtered too.
+_SKIP_TEXT_PREFIXES = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command",
+    "<task-notification>",
+    "<system-reminder>",
+    "Caveat:",
+)
 
 
 @dataclass(frozen=True)
@@ -316,6 +363,31 @@ def _parse_turns(path: Path) -> list[Turn]:
     return turns
 
 
+def _scan_latest_model(path: Path) -> Optional[str]:
+    """The model of the most-recent assistant turn (``message.model``).
+    Lets a mobile resume continue on the session's own model instead of
+    forcing the bridge default. Returns None if no assistant turn records
+    a model (older transcripts / never answered)."""
+    model: Optional[str] = None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if event.get("type") == "assistant" and not event.get("isSidechain"):
+                    msg = event.get("message")
+                    if isinstance(msg, dict) and msg.get("model"):
+                        model = msg["model"]
+    except OSError:
+        return None
+    return model
+
+
 class SessionIndex:
     """mtime-cached view over the transcript tree. One instance is a
     module singleton; it holds parsed cards keyed by path and only
@@ -330,6 +402,9 @@ class SessionIndex:
         # parsing the full turn list is heavier than card metadata, and
         # we only pay it when a conversation is actually opened.
         self._turns_cache: dict[str, tuple[float, int, list[Turn]]] = {}
+        # path -> (mtime, size, model). Latest assistant model, cached so
+        # a resume doesn't re-scan a large transcript every send.
+        self._model_cache: dict[str, tuple[float, int, Optional[str]]] = {}
 
     def _iter_transcripts(self) -> Iterable[Path]:
         if not self._projects_dir.exists():
@@ -404,6 +479,24 @@ class SessionIndex:
             if path.stem == session_id:
                 return path
         return None
+
+    def latest_model(self, session_id: str) -> Optional[str]:
+        """The model the session most recently ran on, or None if unknown.
+        mtime-cached so a resume on a huge transcript doesn't re-scan."""
+        path = self._path_for(session_id)
+        if path is None:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = str(path)
+        cached = self._model_cache.get(key)
+        if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+            return cached[2]
+        model = _scan_latest_model(path)
+        self._model_cache[key] = (stat.st_mtime, stat.st_size, model)
+        return model
 
     def _turns_for(self, path: Path) -> list[Turn]:
         try:

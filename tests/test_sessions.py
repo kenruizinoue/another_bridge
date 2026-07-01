@@ -210,6 +210,25 @@ class TestSessionMessages:
         edit = tool_turn["tools"][1]
         assert edit["stat"] == "+3 -2"  # 3 new lines, 2 old lines
 
+    def test_injected_notifications_filtered_but_mobile_kept(self, tmp_path: Path) -> None:
+        # Background task-notifications / system-reminders arrive as user
+        # turns and must be dropped — but they share promptSource "sdk"
+        # with real mobile messages, so the filter is content-based. A
+        # mobile turn (plain text, sdk source) MUST survive.
+        events = [
+            {"type": "user", "cwd": CWD, "uuid": "u1", "promptSource": "typed", "message": {"role": "user", "content": "real question"}},
+            {"type": "user", "uuid": "n1", "promptSource": "system", "message": {"role": "user", "content": "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"}},
+            {"type": "user", "uuid": "s1", "promptSource": "system", "message": {"role": "user", "content": "<system-reminder>be nice</system-reminder>"}},
+            {"type": "user", "uuid": "m1", "promptSource": "sdk", "message": {"role": "user", "content": "hello from mobile"}},
+            {"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}},
+        ]
+        _write_session(tmp_path, "-Users-dev-proj", "notif-1", events)
+        idx = SessionIndex(projects_dir=tmp_path)
+        user_texts = [m["text"] for m in idx.get_messages("notif-1")["messages"] if m["role"] == "user"]
+        assert "real question" in user_texts
+        assert "hello from mobile" in user_texts  # sdk-sourced mobile msg survives
+        assert all("task-notification" not in t and "system-reminder" not in t for t in user_texts)
+
     def test_ismeta_image_descriptors_are_not_turns(self, tmp_path: Path) -> None:
         # Pasted/read screenshots inject an isMeta user event whose text
         # is "[Image: … Multiply coordinates …]". It is metadata, not a
@@ -252,6 +271,125 @@ class TestSessionMessages:
 
 
 # ── Cache behaviour ───────────────────────────────────────────────────
+
+
+class TestResume:
+    def _mock_ok(self, monkeypatch: pytest.MonkeyPatch, reply: str) -> None:
+        from services.claude_runner import ClaudeResult
+
+        def fake_run_blocking(args, cwd, timeout_seconds, job_id):
+            assert "--resume" in args and "sess-1" in args  # continues the session
+            assert cwd == CWD  # spawned in the session's original dir
+            return ClaudeResult(
+                returncode=0,
+                stdout=json.dumps({"result": reply, "session_id": "sess-1"}),
+                stderr="",
+                timed_out=False,
+                cancelled=False,
+                duration_seconds=0.1,
+            )
+
+        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", fake_run_blocking)
+
+    def test_resume_returns_reply(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._mock_ok(monkeypatch, "hi there")
+        r = client.post("/sessions/sess-1/resume", json={"message": "hello"})
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "session_id": "sess-1", "reply": "hi there"}
+
+    def test_resume_unknown_session_404(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock_ok(monkeypatch, "unused")
+        assert client.post("/sessions/nope/resume", json={"message": "hi"}).status_code == 404
+
+    def test_resume_empty_message_rejected(self, client: TestClient) -> None:
+        # pydantic min_length rejects "" outright (422); no spawn happens.
+        assert client.post("/sessions/sess-1/resume", json={"message": ""}).status_code == 422
+
+    def test_latest_model_reads_session_model(self, tmp_path: Path) -> None:
+        _write_session(
+            tmp_path,
+            "-Users-dev-proj",
+            "modelled",
+            [
+                {"type": "user", "cwd": CWD, "uuid": "u1", "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "yo"}]}},
+            ],
+        )
+        idx = SessionIndex(projects_dir=tmp_path)
+        assert idx.latest_model("modelled") == "claude-sonnet-5"
+
+    def test_resume_falls_back_to_opus_when_no_model(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.claude_runner import ClaudeResult
+
+        captured: dict = {}
+
+        def capture(args, cwd, timeout_seconds, job_id):
+            captured["args"] = args
+            return ClaudeResult(
+                returncode=0, stdout=json.dumps({"result": "ok"}), stderr="",
+                timed_out=False, cancelled=False, duration_seconds=0.1,
+            )
+
+        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", capture)
+        # fixture session sess-1 has no message.model → Opus 4.8 fallback
+        r = client.post("/sessions/sess-1/resume", json={"message": "hi"})
+        assert r.status_code == 200
+        assert "claude-opus-4-8" in captured["args"]
+
+    def test_resume_stream_emits_sse_events(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import contextlib
+
+        # Fake claude stdout: two text deltas + an assistant msg with a
+        # tool_use, so we can assert text/tool/done SSE frames.
+        lines = [
+            json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hel"}}}),
+            json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"description": "list files"}}]}}),
+            json.dumps({"type": "result"}),
+        ]
+
+        class FakeProc:
+            stdout = [f"{l}\n" for l in lines]
+
+        @contextlib.contextmanager
+        def fake_stream(args, cwd, job_id):
+            assert "--include-partial-messages" in args and "--resume" in args
+            yield FakeProc()
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+
+        with client.stream("POST", "/sessions/sess-1/resume/stream", json={"message": "hi"}) as r:
+            assert r.status_code == 200
+            assert "text/event-stream" in r.headers["content-type"]
+            body = "".join(r.iter_text())
+
+        assert "event: text" in body
+        assert '"chunk": "Hel"' in body and '"chunk": "lo"' in body
+        assert "event: tool" in body and "Bash: list files" in body
+        assert "event: done" in body
+
+    def test_resume_stream_unknown_session_404(self, client: TestClient) -> None:
+        assert client.post("/sessions/nope/resume/stream", json={"message": "hi"}).status_code == 404
+
+    def test_resume_spawn_error_500(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.claude_runner import ClaudeResult
+
+        def boom(args, cwd, timeout_seconds, job_id):
+            return ClaudeResult(
+                returncode=-1, stdout="", stderr="", timed_out=False,
+                cancelled=False, duration_seconds=0.0, spawn_error="claude not found",
+            )
+
+        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", boom)
+        assert client.post("/sessions/sess-1/resume", json={"message": "hi"}).status_code == 500
 
 
 class TestCaching:
