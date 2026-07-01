@@ -24,6 +24,7 @@ imports.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import Field
@@ -98,6 +99,18 @@ class Settings(BaseSettings):
     # generate 12 GETs per minute.
     another_coder_rate_limit_jobs: str = "600/minute"
     another_coder_rate_limit_auth_verify: str = "60/minute"
+    # /sessions is a cheap on-disk index read (cached by mtime), so a
+    # mobile card list refreshing on pull-to-refresh won't hammer it.
+    another_coder_rate_limit_sessions: str = "120/minute"
+
+    # ── Session browsing ───────────────────────────────────────────
+    # Root that Claude Code writes per-conversation JSONL transcripts
+    # under (one <encoded-cwd>/ dir per working directory, one
+    # <sessionId>.jsonl per conversation). Empty → resolve at import
+    # from CLAUDE_CONFIG_DIR (Claude Code's own override) else the
+    # ~/.claude default. Exposed so a future test can point it at a
+    # fixture tree instead of the real home dir.
+    another_coder_claude_projects_dir: str = ""
 
 
 # Module-level singleton. Constructed at import; the rest of the
@@ -152,3 +165,19 @@ ANOTHER_CODER_RATE_LIMIT_CHAT_STREAM: str = settings.another_coder_rate_limit_ch
 ANOTHER_CODER_RATE_LIMIT_INSTRUCT: str = settings.another_coder_rate_limit_instruct
 ANOTHER_CODER_RATE_LIMIT_JOBS: str = settings.another_coder_rate_limit_jobs
 ANOTHER_CODER_RATE_LIMIT_AUTH_VERIFY: str = settings.another_coder_rate_limit_auth_verify
+ANOTHER_CODER_RATE_LIMIT_SESSIONS: str = settings.another_coder_rate_limit_sessions
+
+
+# Claude Code transcript root. Resolution order mirrors Claude Code's
+# own: explicit bridge override → CLAUDE_CONFIG_DIR/projects → the
+# ~/.claude/projects default. Computed here so the whole app reads one
+# frozen Path and a future audit greps config.py for "projects".
+def _resolve_claude_projects_dir() -> Path:
+    if settings.another_coder_claude_projects_dir.strip():
+        return Path(settings.another_coder_claude_projects_dir).expanduser()
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    return base / "projects"
+
+
+CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()

@@ -19,7 +19,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from auth import verify_api_key
 from config import CLAUDE_MODEL
-from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos
+from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos, sessions
 from services.claude_runner import probe_claude_binary
 from services.rate_limiter import limiter
 from services.reaper import build_default_reaper
@@ -110,6 +110,9 @@ app.include_router(auth_router.router, dependencies=_authed)
 app.include_router(jobs.router, dependencies=_authed)
 app.include_router(github.router, dependencies=_authed)
 app.include_router(repos.router, dependencies=_authed)
+# Session browsing — GET /sessions[/{id}] serves the mobile card list
+# from the on-disk Claude Code transcript tree (read-only; no resume).
+app.include_router(sessions.router, dependencies=_authed)
 app.include_router(planning.router, dependencies=_authed)
 app.include_router(implementation.router, dependencies=_authed)
 # Chat streaming bridge — POST /chat/stream forwards a turn to a local
