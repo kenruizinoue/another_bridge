@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     # fixture tree instead of the real home dir.
     another_coder_claude_projects_dir: str = ""
 
+    # Where mobile-attached files (PDF, CSV, …) are saved so the resumed
+    # claude can Read them. Empty → ~/.another_coder/attachments. One
+    # subdir per session id. Overridable so tests write to a tmp dir.
+    another_coder_attachments_dir: str = ""
+
 
 # Module-level singleton. Constructed at import; the rest of the
 # codebase reads frozen values via the back-compat constants below.
@@ -194,3 +199,11 @@ CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
 
 ANOTHER_CODER_RESUME_TIMEOUT_SECONDS: int = settings.another_coder_resume_timeout_seconds
 ANOTHER_CODER_RESUME_MODEL: str = settings.another_coder_resume_model
+
+# Mobile file attachments land here (one subdir per session id), then
+# the resume message references the saved paths for claude to Read.
+ANOTHER_CODER_ATTACHMENTS_DIR: Path = (
+    Path(settings.another_coder_attachments_dir).expanduser()
+    if settings.another_coder_attachments_dir.strip()
+    else Path.home() / ".another_coder" / "attachments"
+)

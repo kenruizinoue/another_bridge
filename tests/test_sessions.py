@@ -553,3 +553,144 @@ class TestCaching:
                 + "\n"
             )
         assert index.get_messages("sess-1")["total"] == 5
+
+
+# ── File attachments (the file-drop path) ─────────────────────────────
+
+
+class TestFileAttachments:
+    """Mobile-attached files are saved under ATTACHMENTS_DIR/<session>/
+    and the message gains a footer pointing claude at the paths."""
+
+    B64_HELLO = "aGVsbG8="  # base64("hello")
+
+    @pytest.fixture(autouse=True)
+    def _tmp_attachments_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        self.att_root = tmp_path / "attachments"
+        monkeypatch.setattr(sessions_router, "ANOTHER_CODER_ATTACHMENTS_DIR", self.att_root)
+
+    def _capture_blocking(self, monkeypatch: pytest.MonkeyPatch) -> dict:
+        from services.claude_runner import ClaudeResult
+
+        captured: dict = {}
+
+        def capture(args, cwd, timeout_seconds, job_id):
+            captured["args"] = args
+            return ClaudeResult(
+                returncode=0, stdout=json.dumps({"result": "ok"}), stderr="",
+                timed_out=False, cancelled=False, duration_seconds=0.1,
+            )
+
+        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", capture)
+        return captured
+
+    def test_file_saved_and_message_gets_footer(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured = self._capture_blocking(monkeypatch)
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"message": "summarize this", "files": [{"name": "report.pdf", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 200
+        # decoded bytes landed under <root>/<session>/
+        saved = list((self.att_root / "sess-1").iterdir())
+        assert len(saved) == 1
+        assert saved[0].name.endswith("-report.pdf")
+        assert saved[0].read_bytes() == b"hello"
+        # the prompt claude received references the saved path
+        prompt = " ".join(str(a) for a in captured["args"])
+        assert "summarize this" in prompt
+        assert "Attached files saved on this Mac" in prompt
+        assert str(saved[0]) in prompt
+
+    def test_files_only_message_is_allowed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured = self._capture_blocking(monkeypatch)
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"files": [{"name": "data.csv", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 200
+        prompt = " ".join(str(a) for a in captured["args"])
+        assert "Attached files saved on this Mac" in prompt
+
+    def test_disallowed_extension_rejected(self, client: TestClient) -> None:
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"files": [{"name": "movie.mp4", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 422
+        assert "unsupported file type" in r.json()["detail"]
+        assert not self.att_root.exists() or not list(self.att_root.rglob("*.mp4"))
+
+    def test_path_traversal_is_neutralized(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._capture_blocking(monkeypatch)
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"files": [{"name": "../../../../etc/evil.txt", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 200
+        # the file lands INSIDE the session dir with the basename only
+        saved = list((self.att_root / "sess-1").iterdir())
+        assert len(saved) == 1
+        assert saved[0].name.endswith("-evil.txt")
+        assert saved[0].resolve().is_relative_to(self.att_root.resolve())
+
+    def test_invalid_base64_rejected(self, client: TestClient) -> None:
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"files": [{"name": "notes.txt", "data": "not@base64!!"}]},
+        )
+        assert r.status_code == 422
+        assert "invalid base64" in r.json()["detail"]
+
+    def test_oversize_file_rejected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sessions_router, "MAX_FILE_BYTES", 3)
+        r = client.post(
+            "/sessions/sess-1/resume",
+            json={"files": [{"name": "big.txt", "data": self.B64_HELLO}]},  # 5 bytes > 3
+        )
+        assert r.status_code == 422
+        assert "max" in r.json()["detail"]
+
+    def test_queue_preview_marks_attachments(self) -> None:
+        assert sessions_router._preview("look", [], [1]) == "look"
+        assert sessions_router._preview("", [1, 2], []) == "📎 2 image(s)"
+        assert sessions_router._preview("", [], [1]) == "📎 1 file(s)"
+        assert sessions_router._preview("", [1], [1, 2]) == "📎 1 image(s), 2 file(s)"
+
+    def test_stream_endpoint_saves_files_before_streaming(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # a bad attachment on the STREAM endpoint is a clean HTTP 422,
+        # not a mid-stream error event
+        r = client.post(
+            "/sessions/sess-1/resume/stream",
+            json={"message": "x", "files": [{"name": "movie.mov", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 422
+
+    def test_enqueue_with_file_carries_footer_into_the_turn(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as _time
+
+        captured = self._capture_blocking(monkeypatch)
+        r = client.post(
+            "/sessions/sess-1/resume/queue",
+            json={"files": [{"name": "notes.md", "data": self.B64_HELLO}]},
+        )
+        assert r.status_code == 200
+        for _ in range(50):  # wait for the drain worker
+            if captured.get("args"):
+                break
+            _time.sleep(0.05)
+        prompt = " ".join(str(a) for a in captured["args"])
+        assert "Attached files saved on this Mac" in prompt
+        assert "notes.md" in prompt

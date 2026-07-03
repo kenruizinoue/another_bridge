@@ -12,10 +12,15 @@ bridge: the include-level ``verify_api_key`` gate in main.py, plus a
 per-route slowapi limit keyed on the shared X-Coder-Key.
 """
 
+import base64
+import binascii
 import json
 import queue
+import re
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Iterator
 
 import structlog
@@ -24,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import (
+    ANOTHER_CODER_ATTACHMENTS_DIR,
     ANOTHER_CODER_RATE_LIMIT_SESSIONS,
     ANOTHER_CODER_RESUME_MODEL,
     ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
@@ -62,13 +68,95 @@ class ImageAttachment(BaseModel):
     data: str = Field(min_length=1)
 
 
+# Extensions the file-drop path accepts: things claude can Read (PDF via
+# the Read tool's native support; everything else is text). Media that
+# claude cannot consume (video/audio/binaries) is rejected up front.
+ALLOWED_FILE_EXTENSIONS = frozenset(
+    {
+        "pdf", "txt", "md", "csv", "tsv", "json", "xml", "yaml", "yml",
+        "log", "html", "css", "js", "jsx", "ts", "tsx", "py", "java",
+        "kt", "swift", "c", "h", "cpp", "hpp", "rb", "go", "rs", "sh",
+        "sql", "toml", "ini", "cfg", "conf",
+    }
+)
+MAX_FILES = 5
+MAX_FILE_BYTES = 20 * 1024 * 1024  # decoded size, per file
+
+
+class FileAttachment(BaseModel):
+    """A base64 file the phone attached (raw base64, no ``data:`` prefix).
+
+    Unlike images (inlined as content blocks so the model SEES them),
+    files are saved to disk on the Mac and the message references their
+    paths — the resumed claude Reads them itself. One mechanism for
+    every allowed extension, and a 40MB CSV doesn't blow up the prompt."""
+
+    name: str = Field(min_length=1, max_length=255)
+    data: str = Field(min_length=1)
+
+
 class ResumeRequest(BaseModel):
-    """Body for continuing a session from mobile: a user message and/or up
-    to 10 attached images, appended to the transcript via
-    ``claude --resume <id>``. Either the message or images must be present."""
+    """Body for continuing a session from mobile: a user message and/or
+    attachments (up to 10 inline images, up to 5 dropped files), appended
+    to the transcript via ``claude --resume <id>``. At least one of
+    message / images / files must be present."""
 
     message: str = Field(default="", max_length=100_000)
     images: list[ImageAttachment] = Field(default_factory=list, max_length=10)
+    files: list[FileAttachment] = Field(default_factory=list, max_length=MAX_FILES)
+
+
+def _safe_filename(name: str) -> str:
+    """Bare, traversal-proof filename: basename only, conservative
+    charset, bounded length, extension checked against the allowlist."""
+    base = Path(name).name  # strips any path components
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._") or "file"
+    ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+    if ext not in ALLOWED_FILE_EXTENSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unsupported file type: .{ext or '?'} "
+            f"(allowed: {', '.join(sorted(ALLOWED_FILE_EXTENSIONS))})",
+        )
+    return base[-80:]
+
+
+def _save_files(session_id: str, files: list[FileAttachment]) -> list[str]:
+    """Decode + write attachments under ATTACHMENTS_DIR/<session_id>/ and
+    return the absolute paths. 422 on bad base64, oversize, or disallowed
+    extension — all raised BEFORE any resume starts, so a bad attachment
+    never half-runs a turn."""
+    if not files:
+        return []
+    # session_id comes from the URL path; keep the subdir name boring.
+    session_dir = ANOTHER_CODER_ATTACHMENTS_DIR / re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for f in files:
+        try:
+            blob = base64.b64decode(f.data, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=422, detail=f"file {f.name!r}: invalid base64")
+        if len(blob) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"file {f.name!r} is {len(blob) // (1024 * 1024)}MB; max {MAX_FILE_BYTES // (1024 * 1024)}MB",
+            )
+        target = session_dir / f"{uuid.uuid4().hex[:8]}-{_safe_filename(f.name)}"
+        target.write_bytes(blob)
+        paths.append(str(target))
+    log.info("resume.files_saved", session_id=session_id, count=len(paths))
+    return paths
+
+
+def _with_files_footer(message: str, file_paths: list[str]) -> str:
+    """The message claude actually receives: the user's text plus a footer
+    pointing at the saved attachments for it to Read."""
+    if not file_paths:
+        return message
+    listing = "\n".join(f"- {p}" for p in file_paths)
+    footer = f"Attached files saved on this Mac (open them with the Read tool as needed):\n{listing}"
+    return f"{message}\n\n{footer}" if message else footer
 
 
 def _stdin_message(message: str, images: list[ImageAttachment]) -> str:
@@ -121,19 +209,29 @@ def _resume_started_at(session_id: str) -> float | None:
 # the session to be free, then runs the next message with
 # `claude --resume` (blocking) and repeats. The client just polls status
 # and pulls the transcript when it comes back.
-# Queue items are {"message": str, "images": list[ImageAttachment]}.
+# Queue items are {"message": str (footer already applied),
+# "images": list[ImageAttachment], "preview": str}.
 _queues: dict[str, list[dict]] = {}
 _workers: set[str] = set()
 _queue_guard = threading.Lock()
 
 
+def _preview(message: str, images: list, files: list) -> str:
+    """One-line queue preview: the user's text, or an attachment marker."""
+    if message:
+        return message
+    parts = []
+    if images:
+        parts.append(f"{len(images)} image(s)")
+    if files:
+        parts.append(f"{len(files)} file(s)")
+    return f"📎 {', '.join(parts)}"
+
+
 def _queued(session_id: str) -> list[str]:
-    """Message previews for status (image-only turns show a marker)."""
+    """Message previews for status (attachment-only turns show a marker)."""
     with _queue_guard:
-        return [
-            (it["message"] or f"📎 {len(it['images'])} image(s)")
-            for it in _queues.get(session_id, ())
-        ]
+        return [it["preview"] for it in _queues.get(session_id, ())]
 
 
 def _drain_queue(session_id: str, cwd: str) -> None:
@@ -189,11 +287,14 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             _end_resume(session_id)
 
 
-def _enqueue(session_id: str, cwd: str, message: str, images: list) -> int:
+def _enqueue(session_id: str, cwd: str, message: str, images: list, preview: str) -> int:
     """Append a message (+ images) and ensure a drain worker is running.
-    Returns the new queue depth."""
+    ``message`` already carries the attached-files footer; ``preview`` is
+    what /resume/status shows. Returns the new queue depth."""
     with _queue_guard:
-        _queues.setdefault(session_id, []).append({"message": message, "images": images})
+        _queues.setdefault(session_id, []).append(
+            {"message": message, "images": images, "preview": preview}
+        )
         depth = len(_queues[session_id])
         start_worker = session_id not in _workers
         if start_worker:
@@ -296,8 +397,11 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
     # in-tab sync). That's an accepted tradeoff for the mobile-continue flow.
 
     message = body.message.strip()
-    if not message and not body.images:
-        raise HTTPException(status_code=422, detail="message or images required")
+    if not message and not body.images and not body.files:
+        raise HTTPException(status_code=422, detail="message, images, or files required")
+    # Validate + persist attachments BEFORE claiming the session slot, so
+    # a bad file is a clean 422 with nothing half-started.
+    message = _with_files_footer(message, _save_files(session_id, body.files))
 
     if not _try_start_resume(session_id):
         raise HTTPException(status_code=409, detail="this session is already processing a message")
@@ -361,8 +465,11 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
         raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
     message = body.message.strip()
     images = body.images
-    if not message and not images:
-        raise HTTPException(status_code=422, detail="message or images required")
+    if not message and not images and not body.files:
+        raise HTTPException(status_code=422, detail="message, images, or files required")
+    # Saved (and validated) before streaming starts: attachment problems
+    # surface as a proper HTTP 422, not a mid-stream error event.
+    message = _with_files_footer(message, _save_files(session_id, body.files))
 
     def gen() -> Iterator[str]:
         if not _try_start_resume(session_id):
@@ -469,10 +576,12 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
     if not cwd:
         raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
     message = body.message.strip()
-    if not message and not body.images:
-        raise HTTPException(status_code=422, detail="message or images required")
+    if not message and not body.images and not body.files:
+        raise HTTPException(status_code=422, detail="message, images, or files required")
+    preview = _preview(message, body.images, body.files)
+    message = _with_files_footer(message, _save_files(session_id, body.files))
 
-    depth = _enqueue(session_id, cwd, message, body.images)
+    depth = _enqueue(session_id, cwd, message, body.images, preview)
     return {"ok": True, "session_id": session_id, "queued": depth}
 
 
