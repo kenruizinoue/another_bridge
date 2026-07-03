@@ -57,7 +57,9 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
 
     # ── Claude Code ────────────────────────────────────────────────
-    claude_model: str = "claude-opus-4-7"
+    # Model for the platform chat bridge. Set CLAUDE_MODEL in .env for
+    # a stronger model (e.g. claude-opus-4-8); unset → cheap default.
+    claude_model: str = "claude-haiku-4-5"
     # Empty / unset → falls back to bare "claude" at the consumer
     # (services/claude_runner.py). Stored verbatim here so a misset
     # value (e.g. trailing whitespace) is visible in logs.
