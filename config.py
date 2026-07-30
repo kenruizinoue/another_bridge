@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     # can use a stronger model without changing the webhook pipeline.
     another_coder_resume_model: str = "claude-opus-4-8"
 
+    # OpenAI-compatible speech endpoint the /tts route proxies for the
+    # mobile client's high-quality voice option. Defaults to the local
+    # Kokoro service VoiceMode installs. Empty string disables /tts (503).
+    another_coder_tts_url: str = "http://127.0.0.1:8880/v1/audio/speech"
+    another_coder_tts_voice: str = "af_heart"
+    another_coder_tts_timeout_seconds: int = Field(default=30, ge=1)
+
     # Root that Claude Code writes per-conversation JSONL transcripts
     # under (one <encoded-cwd>/ dir per working directory, one
     # <sessionId>.jsonl per conversation). Empty → resolve at import
@@ -201,6 +208,9 @@ CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
 
 ANOTHER_CODER_RESUME_TIMEOUT_SECONDS: int = settings.another_coder_resume_timeout_seconds
 ANOTHER_CODER_RESUME_MODEL: str = settings.another_coder_resume_model
+ANOTHER_CODER_TTS_URL: str = settings.another_coder_tts_url.strip()
+ANOTHER_CODER_TTS_VOICE: str = settings.another_coder_tts_voice
+ANOTHER_CODER_TTS_TIMEOUT_SECONDS: int = settings.another_coder_tts_timeout_seconds
 
 # Mobile file attachments land here (one subdir per session id), then
 # the resume message references the saved paths for claude to Read.

@@ -21,7 +21,7 @@ name = "another_bridge"
 # the version automatically. Single source of truth — main.py reads
 # it via importlib.metadata so we don't drift between the package
 # manifest and the runtime.
-version = "0.2.0"
+version = "0.3.0"
 description = "FastAPI bridge that exposes local Claude Code as an HTTP/SSE API for the AnotherAgent platform."
 readme = "README.md"
 requires-python = ">=3.10"

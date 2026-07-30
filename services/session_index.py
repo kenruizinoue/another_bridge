@@ -294,11 +294,42 @@ def _tool_ref(block: dict) -> ToolRef:
     return ToolRef(name, name, None)
 
 
+def _unwrap_voice_json(text: Optional[str]) -> Optional[str]:
+    """Voice-mode turns run under ``--json-schema`` so the assistant's
+    final message IS the structured object ({"reply", "speech"}). For the
+    chat view we show the reply; the speech line is delivery metadata."""
+    if not text:
+        return text
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return text
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(data, dict) and isinstance(data.get("reply"), str) and "speech" in data:
+        return data["reply"]
+    return text
+
+
+def _structured_reply(block: dict) -> Optional[str]:
+    """Voice-mode turns run under ``--json-schema``; the CLI records the
+    final answer as a ``StructuredOutput`` tool_use whose input is the
+    {"reply", "speech"} object. The reply IS the turn's text — surface it
+    instead of a bare tool row so the chat view reads normally."""
+    if block.get("name") != "StructuredOutput":
+        return None
+    inp = block.get("input")
+    if isinstance(inp, dict) and isinstance(inp.get("reply"), str) and "speech" in inp:
+        return inp["reply"]
+    return None
+
+
 def _assistant_blocks(content) -> tuple[Optional[str], list[ToolRef]]:
     """Return (joined text, tool summaries) for an assistant message's
     content list. Thinking blocks are ignored entirely."""
     if not isinstance(content, list):
-        return (content if isinstance(content, str) else None), []
+        return _unwrap_voice_json(content if isinstance(content, str) else None), []
     texts: list[str] = []
     tools: list[ToolRef] = []
     for b in content:
@@ -308,8 +339,12 @@ def _assistant_blocks(content) -> tuple[Optional[str], list[ToolRef]]:
         if bt == "text" and b.get("text"):
             texts.append(b["text"])
         elif bt == "tool_use":
-            tools.append(_tool_ref(b))
-    return ("\n".join(texts) if texts else None), tools
+            reply = _structured_reply(b)
+            if reply is not None:
+                texts.append(reply)
+            else:
+                tools.append(_tool_ref(b))
+    return _unwrap_voice_json("\n".join(texts) if texts else None), tools
 
 
 def _parse_turns(path: Path) -> list[Turn]:

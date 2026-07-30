@@ -99,11 +99,78 @@ class ResumeRequest(BaseModel):
     """Body for continuing a session from mobile: a user message and/or
     attachments (up to 10 inline images, up to 5 dropped files), appended
     to the transcript via ``claude --resume <id>``. At least one of
-    message / images / files must be present."""
+    message / images / files must be present.
+
+    ``voice`` marks a conversation-mode turn: the run switches to
+    ``--output-format json --json-schema`` so the reply is GUARANTEED to
+    carry a short spoken summary (the ``speech`` field) alongside the
+    full text. The tradeoff is no token streaming for that turn."""
 
     message: str = Field(default="", max_length=100_000)
     images: list[ImageAttachment] = Field(default_factory=list, max_length=10)
     files: list[FileAttachment] = Field(default_factory=list, max_length=MAX_FILES)
+    voice: bool = False
+
+
+# Schema for voice turns. Brevity and the no-code rule live in the field
+# descriptions because the structured-output validator does not support
+# minLength/maxLength constraints.
+VOICE_SPEECH_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "reply": {
+            "type": "string",
+            "description": "The full answer, exactly as it would normally be written.",
+        },
+        "speech": {
+            "type": "string",
+            "description": (
+                "One or two short spoken sentences summarizing the reply for "
+                "audio. No code, no diffs, no file paths, no markdown. Written "
+                "in the same language as the user's message."
+            ),
+        },
+    },
+    "required": ["reply", "speech"],
+    "additionalProperties": False,
+}
+VOICE_SPEECH_SCHEMA_JSON = json.dumps(VOICE_SPEECH_SCHEMA)
+
+
+# A turn driven from the phone must NEVER do voice I/O on the Mac: if the
+# resumed session has the VoiceMode MCP loaded (a desktop voice chat), the
+# model would otherwise speak through the Mac's speakers and wait on the
+# Mac's microphone. The phone is the only voice surface for mobile turns.
+MAC_VOICE_TOOLS = "mcp__plugin_voicemode_voicemode__*,mcp__voicemode__*"
+
+
+def _resume_flags(session_id: str) -> list[str]:
+    """Base flags for every mobile-driven resume."""
+    return ["--resume", session_id, "--disallowed-tools", MAC_VOICE_TOOLS]
+
+
+def _voice_flags(session_id: str) -> list[str]:
+    """Extra flags for a schema-guaranteed voice turn."""
+    return _resume_flags(session_id) + ["--json-schema", VOICE_SPEECH_SCHEMA_JSON]
+
+
+def _voice_result(stdout: str) -> tuple[str, str | None]:
+    """(reply, speech) out of a ``--output-format json`` voice run. Falls
+    back to the plain result text with no speech when the structured
+    field is missing (older CLI / model ignored the schema)."""
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return _extract_reply(stdout), None
+    if not isinstance(data, dict):
+        return _extract_reply(stdout), None
+    structured = data.get("structured_output")
+    if isinstance(structured, dict) and structured.get("speech"):
+        return (
+            str(structured.get("reply") or data.get("result") or ""),
+            str(structured["speech"]),
+        )
+    return str(data.get("result") or ""), None
 
 
 def _safe_filename(name: str) -> str:
@@ -263,11 +330,15 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
             job = job_manager.create(kind="resume_queue")
             log.info("resume_queue.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
+            voice = bool(item.get("voice"))
             if item["images"]:
                 # Images can't go on the CLI — feed via stream-json stdin.
+                # Voice turns switch to json output for the schema guarantee.
                 args = claude_runner.build_claude_stdin_args(
-                    model=model, output_format="stream-json",
-                    extra_flags=["--verbose", "--resume", session_id],
+                    model=model,
+                    output_format="json" if voice else "stream-json",
+                    extra_flags=_voice_flags(session_id) if voice
+                    else ["--verbose"] + _resume_flags(session_id),
                 )
                 claude_runner.run_blocking_stdin(
                     args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
@@ -276,7 +347,7 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             else:
                 args = claude_runner.build_claude_args(
                     prompt=item["message"], model=model, output_format="json",
-                    extra_flags=["--resume", session_id],
+                    extra_flags=_voice_flags(session_id) if voice else _resume_flags(session_id),
                 )
                 claude_runner.run_blocking(
                     args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
@@ -287,13 +358,15 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             _end_resume(session_id)
 
 
-def _enqueue(session_id: str, cwd: str, message: str, images: list, preview: str) -> int:
+def _enqueue(
+    session_id: str, cwd: str, message: str, images: list, preview: str, voice: bool = False
+) -> int:
     """Append a message (+ images) and ensure a drain worker is running.
     ``message`` already carries the attached-files footer; ``preview`` is
     what /resume/status shows. Returns the new queue depth."""
     with _queue_guard:
         _queues.setdefault(session_id, []).append(
-            {"message": message, "images": images, "preview": preview}
+            {"message": message, "images": images, "preview": preview, "voice": voice}
         )
         depth = len(_queues[session_id])
         start_worker = session_id not in _workers
@@ -411,7 +484,10 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
         log.info("resume_session.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
         if body.images:
             args = claude_runner.build_claude_stdin_args(
-                model=model, output_format="stream-json", extra_flags=["--verbose", "--resume", session_id]
+                model=model,
+                output_format="json" if body.voice else "stream-json",
+                extra_flags=_voice_flags(session_id) if body.voice
+                else ["--verbose"] + _resume_flags(session_id),
             )
             result = claude_runner.run_blocking_stdin(
                 args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
@@ -419,7 +495,8 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
             )
         else:
             args = claude_runner.build_claude_args(
-                prompt=message, model=model, output_format="json", extra_flags=["--resume", session_id]
+                prompt=message, model=model, output_format="json",
+                extra_flags=_voice_flags(session_id) if body.voice else _resume_flags(session_id),
             )
             result = claude_runner.run_blocking(
                 args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
@@ -437,6 +514,9 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
             detail = (result.stderr or result.stdout or "").strip()[:300]
             raise HTTPException(status_code=502, detail=f"claude exited {result.returncode}: {detail}")
 
+        if body.voice:
+            reply, speech = _voice_result(result.stdout)
+            return {"ok": True, "session_id": session_id, "reply": reply, "speech": speech}
         return {"ok": True, "session_id": session_id, "reply": _extract_reply(result.stdout)}
     finally:
         _end_resume(session_id)
@@ -471,6 +551,9 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
     # surface as a proper HTTP 422, not a mid-stream error event.
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
+    if body.voice:
+        return _voice_stream_response(session_id, cwd, message, images)
+
     def gen() -> Iterator[str]:
         if not _try_start_resume(session_id):
             yield _sse("error", {"message": "this session is already processing a message"})
@@ -486,7 +569,7 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
             if images:
                 args = claude_runner.build_claude_stdin_args(
                     model=model, output_format="stream-json",
-                    extra_flags=["--verbose", "--include-partial-messages", "--resume", session_id],
+                    extra_flags=["--verbose", "--include-partial-messages"] + _resume_flags(session_id),
                 )
                 ctx = claude_runner.streaming_subprocess_stdin(
                     args, cwd=cwd, job_id=job.job_id, stdin_data=_stdin_message(message, images)
@@ -494,7 +577,7 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
             else:
                 args = claude_runner.build_claude_args(
                     prompt=message, model=model, output_format="stream-json",
-                    extra_flags=["--verbose", "--include-partial-messages", "--resume", session_id],
+                    extra_flags=["--verbose", "--include-partial-messages"] + _resume_flags(session_id),
                 )
                 ctx = claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job.job_id)
             try:
@@ -561,6 +644,91 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _voice_stream_response(
+    session_id: str, cwd: str, message: str, images: list[ImageAttachment]
+) -> StreamingResponse:
+    """Voice-mode variant of the resume stream. The run is blocking (the
+    schema guarantee is incompatible with token streaming), so the claude
+    process runs on a worker thread while the generator emits keepalives;
+    when it finishes we emit the full reply as one ``text`` chunk, then a
+    ``speech`` event with the guaranteed summary, then ``done``. The same
+    per-session lock and disconnect semantics apply: the worker clears the
+    in-flight marker when the PROCESS exits, not when the request ends."""
+
+    def gen() -> Iterator[str]:
+        if not _try_start_resume(session_id):
+            yield _sse("error", {"message": "this session is already processing a message"})
+            return
+        outcome: "queue.Queue" = queue.Queue()
+
+        def _worker() -> None:
+            try:
+                model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
+                job = job_manager.create(kind="resume_session_voice")
+                log.info(
+                    "resume_voice.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id
+                )
+                if images:
+                    args = claude_runner.build_claude_stdin_args(
+                        model=model, output_format="json", extra_flags=_voice_flags(session_id)
+                    )
+                    result = claude_runner.run_blocking_stdin(
+                        args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
+                        job_id=job.job_id, stdin_data=_stdin_message(message, images),
+                    )
+                else:
+                    args = claude_runner.build_claude_args(
+                        prompt=message, model=model, output_format="json",
+                        extra_flags=_voice_flags(session_id),
+                    )
+                    result = claude_runner.run_blocking(
+                        args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
+                        job_id=job.job_id,
+                    )
+                outcome.put(result)
+            except Exception as err:  # surfaced as an SSE error below
+                outcome.put(err)
+            finally:
+                _end_resume(session_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while True:
+            try:
+                result = outcome.get(timeout=10)
+                break
+            except queue.Empty:
+                yield ": keepalive\n\n"
+
+        if isinstance(result, Exception):
+            yield _sse("error", {"message": f"claude failed: {result}"})
+            return
+        if result.spawn_error:
+            yield _sse("error", {"message": f"could not spawn claude: {result.spawn_error}"})
+            return
+        if result.timed_out:
+            yield _sse(
+                "error",
+                {
+                    "message": f"claude timed out after {ANOTHER_CODER_RESUME_TIMEOUT_SECONDS}s "
+                    "(the turn may be partially written; refresh to see it)"
+                },
+            )
+            return
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[:300]
+            yield _sse("error", {"message": f"claude exited {result.returncode}: {detail}"})
+            return
+
+        reply, speech = _voice_result(result.stdout)
+        if reply:
+            yield _sse("text", {"chunk": reply})
+        if speech:
+            yield _sse("speech", {"speech": speech})
+        yield _sse("done", {"session_id": session_id})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 @router.post("/sessions/{session_id}/resume/queue")
 @limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
 def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> dict[str, Any]:
@@ -581,7 +749,7 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
     preview = _preview(message, body.images, body.files)
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
-    depth = _enqueue(session_id, cwd, message, body.images, preview)
+    depth = _enqueue(session_id, cwd, message, body.images, preview, voice=body.voice)
     return {"ok": True, "session_id": session_id, "queued": depth}
 
 
