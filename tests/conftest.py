@@ -52,6 +52,18 @@ def _clean_session_store():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_terminal_sessions(tmp_path_factory, monkeypatch):
+    """Point the terminal checker at an empty folder so no test reads the
+    real ``~/.claude/sessions`` (the Mac's live Claude Code processes).
+    Tests that need a terminal copy build their own folder."""
+    from services import terminal_activity
+
+    empty = tmp_path_factory.mktemp("claude-sessions")
+    monkeypatch.setattr(terminal_activity, "watch", terminal_activity.TerminalWatch(empty))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_rate_limiter():
     """Drain slowapi's in-memory bucket between tests so a heavy-traffic
     test in one file (or a new test class that adds more /chat/stream

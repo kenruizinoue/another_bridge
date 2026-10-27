@@ -75,6 +75,32 @@ class Settings(BaseSettings):
     # ``auth.verify_api_key`` (returns 503) — refusing to silently
     # allow-all when the operator forgot to set the secret.
     another_coder_api_key: str = ""
+    # The phone's own key (another_bridge_mobile). Keys are read from the
+    # environment by auth.py; these fields only document them.
+    another_bridge_phone_key: str = ""
+
+    # ── Files for the phone ────────────────────────────────────────
+    # Read-only folders the phone can browse, as comma separated
+    # name=folder pairs, like "outputs=~/agent_outputs". Each folder must
+    # exist inside the home folder. Empty turns the Files view off.
+    another_bridge_file_roots: str = ""
+    another_bridge_rate_limit_files: str = "240/minute"
+    # Video players fetch a file in many Range requests, so raw files get
+    # a wider limit than listings.
+    another_bridge_rate_limit_files_raw: str = "600/minute"
+
+    # ── Terminal copies and the turn cap ───────────────────────────
+    # A phone message waits in the queue while the same session is working
+    # in a terminal tab: its status is busy, or its lines or its agents
+    # changed within this many seconds.
+    another_bridge_terminal_active_seconds: int = Field(default=120, ge=10)
+    # Phone turns running at once across all sessions; more wait in the
+    # queue. Several big sessions at once used up the plan's 5-hour limit
+    # in about 90 minutes on October 26, 2026.
+    another_bridge_max_running_turns: int = Field(default=2, ge=1)
+    # Claude Code's per-process files (pid, sessionId, status). Empty means
+    # <claude-config>/sessions, next to the projects folder.
+    another_bridge_claude_sessions_dir: str = ""
 
     # ── Persistence ────────────────────────────────────────────────
     # Empty → resolved to ~/.another_coder/sessions.db at consumer
@@ -114,7 +140,7 @@ class Settings(BaseSettings):
     # Model for mobile resume/stream ONLY — kept separate from CLAUDE_MODEL
     # (the platform bridge's model) so continuing a session from the phone
     # can use a stronger model without changing the webhook pipeline.
-    another_coder_resume_model: str = "claude-opus-4-8"
+    another_coder_resume_model: str = "claude-opus-5-5"
 
     # OpenAI-compatible speech endpoint the /tts route proxies for the
     # mobile client's high-quality voice option. Defaults to the local
@@ -190,6 +216,9 @@ ANOTHER_CODER_RATE_LIMIT_INSTRUCT: str = settings.another_coder_rate_limit_instr
 ANOTHER_CODER_RATE_LIMIT_JOBS: str = settings.another_coder_rate_limit_jobs
 ANOTHER_CODER_RATE_LIMIT_AUTH_VERIFY: str = settings.another_coder_rate_limit_auth_verify
 ANOTHER_CODER_RATE_LIMIT_SESSIONS: str = settings.another_coder_rate_limit_sessions
+ANOTHER_BRIDGE_FILE_ROOTS: str = settings.another_bridge_file_roots
+ANOTHER_BRIDGE_RATE_LIMIT_FILES: str = settings.another_bridge_rate_limit_files
+ANOTHER_BRIDGE_RATE_LIMIT_FILES_RAW: str = settings.another_bridge_rate_limit_files_raw
 
 
 # Claude Code transcript root. Resolution order mirrors Claude Code's
@@ -205,6 +234,14 @@ def _resolve_claude_projects_dir() -> Path:
 
 
 CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
+
+ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS: int = settings.another_bridge_terminal_active_seconds
+ANOTHER_BRIDGE_MAX_RUNNING_TURNS: int = settings.another_bridge_max_running_turns
+ANOTHER_BRIDGE_CLAUDE_SESSIONS_DIR: Path = (
+    Path(settings.another_bridge_claude_sessions_dir).expanduser()
+    if settings.another_bridge_claude_sessions_dir.strip()
+    else CLAUDE_PROJECTS_DIR.parent / "sessions"
+)
 
 ANOTHER_CODER_RESUME_TIMEOUT_SECONDS: int = settings.another_coder_resume_timeout_seconds
 ANOTHER_CODER_RESUME_MODEL: str = settings.another_coder_resume_model

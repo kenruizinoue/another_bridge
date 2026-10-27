@@ -115,6 +115,8 @@ def _reset_resume_state():
     with sessions_router._queue_guard:
         sessions_router._queues.clear()
         sessions_router._workers.clear()
+    with sessions_router.live_runs._guard:
+        sessions_router.live_runs._runs.clear()
 
 
 # ── Cards ─────────────────────────────────────────────────────────────
@@ -362,10 +364,10 @@ class TestResume:
             )
 
         monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", capture)
-        # fixture session sess-1 has no message.model → Opus 4.8 fallback
+        # fixture session sess-1 has no message.model → Opus 5.5 fallback
         r = client.post("/sessions/sess-1/resume", json={"message": "hi"})
         assert r.status_code == 200
-        assert "claude-opus-4-8" in captured["args"]
+        assert "claude-opus-5-5" in captured["args"]
 
     def test_resume_stream_emits_sse_events(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -462,20 +464,21 @@ class TestResume:
             "".join(r.iter_text())
 
     def test_queue_drains_in_order(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        import contextlib
         import time as _t
-
-        from services.claude_runner import ClaudeResult
 
         ran: list[str] = []
 
-        def fake_run_blocking(args, cwd, timeout_seconds, job_id):
+        @contextlib.contextmanager
+        def fake_stream(args, cwd, job_id):
             ran.append(args[args.index("-p") + 1])  # the prompt
-            return ClaudeResult(
-                returncode=0, stdout='{"result": "ok"}', stderr="",
-                timed_out=False, cancelled=False, duration_seconds=0.0,
-            )
 
-        monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", fake_run_blocking)
+            class P:
+                stdout = ['{"type": "result"}\n']
+
+            yield P()
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
 
         assert client.post("/sessions/sess-1/resume/queue", json={"message": "first"}).json()["queued"] >= 1
         assert client.post("/sessions/sess-1/resume/queue", json={"message": "second"}).json()["ok"] is True
@@ -502,6 +505,8 @@ class TestResume:
             "started_at": None,
             "queued": [],
             "queue_count": 0,
+            "held": None,
+            "terminal": None,
         }
         assert sessions_router._try_start_resume("sess-1") is True
         try:
@@ -681,7 +686,20 @@ class TestFileAttachments:
     ) -> None:
         import time as _time
 
-        captured = self._capture_blocking(monkeypatch)
+        import contextlib
+
+        captured: dict = {}
+
+        @contextlib.contextmanager
+        def fake_stream(args, cwd, job_id):
+            captured["args"] = args
+
+            class P:
+                stdout = ['{"type": "result"}\n']
+
+            yield P()
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
         r = client.post(
             "/sessions/sess-1/resume/queue",
             json={"files": [{"name": "notes.md", "data": self.B64_HELLO}]},

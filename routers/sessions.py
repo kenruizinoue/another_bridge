@@ -29,13 +29,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import (
+    ANOTHER_BRIDGE_MAX_RUNNING_TURNS,
     ANOTHER_CODER_ATTACHMENTS_DIR,
     ANOTHER_CODER_RATE_LIMIT_SESSIONS,
     ANOTHER_CODER_RESUME_MODEL,
     ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
 )
 from jobs import job_manager
-from services import claude_runner
+from services import claude_runner, live_runs, terminal_activity
 from services.rate_limiter import limiter
 from services.session_index import _assistant_blocks, session_index
 
@@ -60,12 +61,17 @@ log = structlog.get_logger()
 router = APIRouter()
 
 
+# About 10 MB decoded per image. The whole request is also capped at
+# 40 MB by services/guard.py.
+MAX_IMAGE_B64_CHARS = 14_000_000
+
+
 class ImageAttachment(BaseModel):
     """A base64 image the phone attached to a message (raw base64, no
     ``data:`` prefix)."""
 
     media_type: str = Field(pattern=r"^image/(png|jpeg|jpg|webp|gif)$")
-    data: str = Field(min_length=1)
+    data: str = Field(min_length=1, max_length=MAX_IMAGE_B64_CHARS)
 
 
 # Extensions the file-drop path accepts: things claude can Read (PDF via
@@ -110,6 +116,9 @@ class ResumeRequest(BaseModel):
     images: list[ImageAttachment] = Field(default_factory=list, max_length=10)
     files: list[FileAttachment] = Field(default_factory=list, max_length=MAX_FILES)
     voice: bool = False
+    # "Send anyway": run now even if the session is working in a terminal
+    # tab or the running-turn cap is reached.
+    force: bool = False
 
 
 # Schema for voice turns. Brevity and the no-code rule live in the field
@@ -250,18 +259,122 @@ _running_resumes: dict[str, float] = {}
 _running_guard = threading.Lock()
 
 
+def _mark_running_locked(session_id: str) -> None:
+    _running_resumes[session_id] = time.time()
+    live_runs.start(session_id)
+
+
 def _try_start_resume(session_id: str) -> bool:
-    """Atomically mark a resume as running; False if one already is."""
+    """Atomically mark a resume as running; False if one already is.
+    Also opens the turn's live run, so a phone can attach to it. No
+    terminal or cap checks: ``_claim`` is the gate for new turns."""
     with _running_guard:
         if session_id in _running_resumes:
             return False
-        _running_resumes[session_id] = time.time()
+        _mark_running_locked(session_id)
         return True
 
 
+def _terminal(session_id: str) -> "terminal_activity.TerminalState | None":
+    """Another live Claude Code copy of this session (a terminal tab)."""
+    return terminal_activity.watch.state(session_id, session_index.transcript_path(session_id))
+
+
+def _claim(session_id: str, *, force: bool = False) -> str | None:
+    """Claim the session for a new turn. None when claimed, else why not:
+
+    - ``"busy"``: a bridge turn already runs on this session.
+    - ``"terminal"``: the session is working in a terminal tab. A second
+      copy would redo its work (October 27, 2026, the GR00T script).
+    - ``"limit"``: ANOTHER_BRIDGE_MAX_RUNNING_TURNS turns already run.
+
+    ``force`` ("Send anyway") skips the terminal and cap checks, never the
+    busy one, which protects the transcript."""
+    if not force:
+        state = _terminal(session_id)
+        if state is not None and state.active:
+            return "terminal"
+    with _running_guard:
+        if session_id in _running_resumes:
+            return "busy"
+        if not force and len(_running_resumes) >= ANOTHER_BRIDGE_MAX_RUNNING_TURNS:
+            return "limit"
+        _mark_running_locked(session_id)
+        return None
+
+
+# What /resume/blocking callers and SSE clients are told for each reason.
+_HOLD_MESSAGES = {
+    "busy": "this session is already processing a message",
+    "terminal": "this session is working in a terminal on the Mac",
+    "limit": f"{ANOTHER_BRIDGE_MAX_RUNNING_TURNS} phone turns are already running",
+}
+
+
 def _end_resume(session_id: str) -> None:
+    # Under the same lock as the start, so a queued turn claiming the
+    # session right after can't have its new live run closed by mistake.
     with _running_guard:
         _running_resumes.pop(session_id, None)
+        live_runs.finish(session_id)
+
+
+def _live_run(session_id: str) -> live_runs.LiveRun:
+    """The live run this turn just opened (a detached one if it is gone)."""
+    return live_runs.get(session_id) or live_runs.LiveRun()
+
+
+def _publish_line(run: live_runs.LiveRun, raw: str) -> None:
+    """One stream-json line from claude into the turn's live events: text
+    deltas as they arrive, then each finished message's tool steps (its
+    text was already streamed by the deltas)."""
+    line = raw.strip()
+    if not line:
+        return
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+    chunk = _text_delta(event)
+    if chunk:
+        run.publish("text", {"chunk": chunk})
+        return
+    if event.get("type") == "assistant":
+        _, tools = _assistant_blocks(event.get("message", {}).get("content"))
+        for t in tools:
+            run.publish("tool", {"name": t.name, "label": t.label, "stat": t.stat})
+        run.end_message()
+
+
+def _follow_sse(run: live_runs.LiveRun, start: int | None = None) -> Iterator[str]:
+    """A live run as SSE frames, with a keepalive comment every 10 quiet
+    seconds so cellular NAT and ngrok keep the connection open."""
+    for item in run.follow(start):
+        if item is None:
+            yield ": keepalive\n\n"  # SSE comment, clients ignore it
+        else:
+            yield _sse(*item)
+
+
+def _spawn_streaming(session_id: str, cwd: str, message: str, images: list, job_id: str):
+    """Start ``claude --resume`` with token streaming. Images can't ride
+    the CLI, so they go as a stream-json user turn on stdin; text-only
+    stays on the -p positional. Returns the subprocess context manager."""
+    model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
+    flags = ["--verbose", "--include-partial-messages"] + _resume_flags(session_id)
+    if images:
+        args = claude_runner.build_claude_stdin_args(
+            model=model, output_format="stream-json", extra_flags=flags
+        )
+        return claude_runner.streaming_subprocess_stdin(
+            args, cwd=cwd, job_id=job_id, stdin_data=_stdin_message(message, images)
+        )
+    args = claude_runner.build_claude_args(
+        prompt=message, model=model, output_format="stream-json", extra_flags=flags
+    )
+    return claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job_id)
 
 
 def _resume_started_at(session_id: str) -> float | None:
@@ -277,10 +390,17 @@ def _resume_started_at(session_id: str) -> float | None:
 # `claude --resume` (blocking) and repeats. The client just polls status
 # and pulls the transcript when it comes back.
 # Queue items are {"message": str (footer already applied),
-# "images": list[ImageAttachment], "preview": str}.
+# "images": list[ImageAttachment], "preview": str, "voice": bool,
+# "force": bool}. The worker also waits while the session works in a
+# terminal tab or the running-turn cap is reached; ``_holds`` records why,
+# for /resume/status.
 _queues: dict[str, list[dict]] = {}
 _workers: set[str] = set()
+_holds: dict[str, str] = {}
 _queue_guard = threading.Lock()
+
+# How often a held queue checks the terminal and the cap again.
+HOLD_POLL_SECONDS = 2.0
 
 
 def _preview(message: str, images: list, files: list) -> str:
@@ -312,14 +432,25 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             if not _queues.get(session_id):
                 _queues.pop(session_id, None)
                 _workers.discard(session_id)
+                _holds.pop(session_id, None)
                 return
+            force = bool(_queues[session_id][0].get("force"))
 
-        # Wait until the session is free (a live stream or a prior queued
-        # run holds the slot). _try_start_resume claims it atomically.
-        while not _try_start_resume(session_id):
-            time.sleep(0.3)
+        # Wait until the session is free: no bridge turn on it, not
+        # working in a terminal tab, and a slot under the cap. _claim
+        # takes it atomically. "Send anyway" sets force on the items.
+        reason = _claim(session_id, force=force)
+        if reason is not None:
+            with _queue_guard:
+                if reason == "busy":
+                    _holds.pop(session_id, None)
+                else:
+                    _holds[session_id] = reason
+            time.sleep(0.3 if reason == "busy" else HOLD_POLL_SECONDS)
+            continue
 
         with _queue_guard:
+            _holds.pop(session_id, None)
             pending = _queues.get(session_id) or []
             item = pending.pop(0) if pending else None
         if item is None:
@@ -327,46 +458,57 @@ def _drain_queue(session_id: str, cwd: str) -> None:
             continue
 
         try:
-            model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
             job = job_manager.create(kind="resume_queue")
             log.info("resume_queue.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
-            voice = bool(item.get("voice"))
-            if item["images"]:
-                # Images can't go on the CLI — feed via stream-json stdin.
-                # Voice turns switch to json output for the schema guarantee.
-                args = claude_runner.build_claude_stdin_args(
-                    model=model,
-                    output_format="json" if voice else "stream-json",
-                    extra_flags=_voice_flags(session_id) if voice
-                    else ["--verbose"] + _resume_flags(session_id),
-                )
-                claude_runner.run_blocking_stdin(
-                    args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
-                    job_id=job.job_id, stdin_data=_stdin_message(item["message"], item["images"]),
-                )
+            if item.get("voice"):
+                _run_queued_voice(session_id, cwd, item, job.job_id)
             else:
-                args = claude_runner.build_claude_args(
-                    prompt=item["message"], model=model, output_format="json",
-                    extra_flags=_voice_flags(session_id) if voice else _resume_flags(session_id),
-                )
-                claude_runner.run_blocking(
-                    args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job.job_id
-                )
+                # Streamed like a live send, so a phone can attach and watch
+                # it, with no 300 s cut (ticket 8 adds one deadline for all).
+                run = _live_run(session_id)
+                with _spawn_streaming(
+                    session_id, cwd, item["message"], item["images"], job.job_id
+                ) as proc:
+                    for raw in proc.stdout:
+                        _publish_line(run, raw)
         except Exception as err:  # a bad turn must not kill the worker
             log.error("resume_queue.failed", session_id=session_id, error=str(err))
         finally:
             _end_resume(session_id)
 
 
+def _run_queued_voice(session_id: str, cwd: str, item: dict, job_id: str) -> None:
+    """A queued voice turn: blocking json output for the schema guarantee,
+    so it has no live events (an attached phone just waits for done)."""
+    model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
+    if item["images"]:
+        args = claude_runner.build_claude_stdin_args(
+            model=model, output_format="json", extra_flags=_voice_flags(session_id)
+        )
+        claude_runner.run_blocking_stdin(
+            args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
+            job_id=job_id, stdin_data=_stdin_message(item["message"], item["images"]),
+        )
+    else:
+        args = claude_runner.build_claude_args(
+            prompt=item["message"], model=model, output_format="json",
+            extra_flags=_voice_flags(session_id),
+        )
+        claude_runner.run_blocking(
+            args, cwd=cwd, timeout_seconds=ANOTHER_CODER_RESUME_TIMEOUT_SECONDS, job_id=job_id
+        )
+
+
 def _enqueue(
-    session_id: str, cwd: str, message: str, images: list, preview: str, voice: bool = False
+    session_id: str, cwd: str, message: str, images: list, preview: str,
+    voice: bool = False, force: bool = False,
 ) -> int:
     """Append a message (+ images) and ensure a drain worker is running.
     ``message`` already carries the attached-files footer; ``preview`` is
     what /resume/status shows. Returns the new queue depth."""
     with _queue_guard:
         _queues.setdefault(session_id, []).append(
-            {"message": message, "images": images, "preview": preview, "voice": voice}
+            {"message": message, "images": images, "preview": preview, "voice": voice, "force": force}
         )
         depth = len(_queues[session_id])
         start_worker = session_id not in _workers
@@ -417,6 +559,16 @@ def list_sessions(
     sessions, total = session_index.list_cards(
         query=q, project=project, limit=limit, offset=offset
     )
+    # Each card says whether a terminal tab holds the session and is
+    # working, so the list can show it before Ken opens the chat.
+    records = terminal_activity.watch.records()
+    for card in sessions:
+        state = None
+        if card["session_id"] in records:
+            state = terminal_activity.watch.state(
+                card["session_id"], session_index.transcript_path(card["session_id"]), records=records
+            )
+        card["terminal"] = state.as_dict() if state else None
     return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
 
 
@@ -463,11 +615,9 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
     if not cwd:
         raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
 
-    # NOTE: intentionally NOT blocking sessions that are live in a terminal.
-    # Resuming spawns a second `claude` that appends to the transcript; the
-    # open terminal tab keeps stale in-memory context and won't see these
-    # turns until it re-reads the file (a fresh `claude -r <id>` or a manual
-    # in-tab sync). That's an accepted tradeoff for the mobile-continue flow.
+    # A session open but quiet in a terminal tab is resumed anyway: the tab
+    # catches up from the transcript (its sync hook). One that is WORKING
+    # there is refused (409), since a second copy would redo its work.
 
     message = body.message.strip()
     if not message and not body.images and not body.files:
@@ -476,8 +626,9 @@ def resume_session(request: Request, session_id: str, body: ResumeRequest) -> di
     # a bad file is a clean 422 with nothing half-started.
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
-    if not _try_start_resume(session_id):
-        raise HTTPException(status_code=409, detail="this session is already processing a message")
+    reason = _claim(session_id, force=body.force)
+    if reason is not None:
+        raise HTTPException(status_code=409, detail=_HOLD_MESSAGES[reason])
     try:
         model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
         job = job_manager.create(kind="resume_session")
@@ -533,10 +684,14 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
         event: tool  data: {"label": "...", "stat": "..."}  # a tool step
         event: done  data: {"session_id": "..."}
         event: error data: {"message": "..."}
+        event: queued data: {"reason": "terminal" | "limit", "queued": n}
 
     404 unknown id (raised before streaming). Concurrency is guarded by
     the same per-session lock as the blocking endpoint — a second send
-    gets an `error` event rather than corrupting the transcript."""
+    gets an `error` event rather than corrupting the transcript. When the
+    session is working in a terminal tab, or the running-turn cap is
+    reached, the message goes to the queue instead (``queued``, then
+    ``done``) and runs by itself once that clears. ``force`` skips both."""
     card = session_index.get_card(session_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
@@ -547,89 +702,46 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
     images = body.images
     if not message and not images and not body.files:
         raise HTTPException(status_code=422, detail="message, images, or files required")
+    preview = _preview(message, images, body.files)
     # Saved (and validated) before streaming starts: attachment problems
     # surface as a proper HTTP 422, not a mid-stream error event.
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
     if body.voice:
-        return _voice_stream_response(session_id, cwd, message, images)
+        return _voice_stream_response(session_id, cwd, message, images, preview, body.force)
 
     def gen() -> Iterator[str]:
-        if not _try_start_resume(session_id):
-            yield _sse("error", {"message": "this session is already processing a message"})
+        reason = _claim(session_id, force=body.force)
+        if reason == "busy":
+            yield _sse("error", {"message": _HOLD_MESSAGES[reason]})
             return
+        if reason is not None:
+            yield from _queued_sse(session_id, cwd, message, images, preview, reason, voice=False)
+            return
+        run = _live_run(session_id)
         spawned = False
         try:
-            model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
             job = job_manager.create(kind="resume_session_stream")
             log.info("resume_stream.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
-            # Images can't ride the CLI — feed the message as a stream-json
-            # user turn (text + image blocks) on stdin. Text-only stays on
-            # the -p positional (cheaper, unchanged).
-            if images:
-                args = claude_runner.build_claude_stdin_args(
-                    model=model, output_format="stream-json",
-                    extra_flags=["--verbose", "--include-partial-messages"] + _resume_flags(session_id),
-                )
-                ctx = claude_runner.streaming_subprocess_stdin(
-                    args, cwd=cwd, job_id=job.job_id, stdin_data=_stdin_message(message, images)
-                )
-            else:
-                args = claude_runner.build_claude_args(
-                    prompt=message, model=model, output_format="stream-json",
-                    extra_flags=["--verbose", "--include-partial-messages"] + _resume_flags(session_id),
-                )
-                ctx = claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job.job_id)
             try:
-                with ctx as proc:
-                    # Read claude's stdout on a thread into a queue so the
-                    # generator can emit an SSE heartbeat during the long
-                    # SILENT phase (resuming a big session loads/replays the
-                    # transcript before any token). Without heartbeats an
-                    # idle minutes-long connection gets dropped by cellular
-                    # NAT / ngrok, which the client would misread as "done".
-                    lines: "queue.Queue" = queue.Queue()
-                    STDOUT_EOF = object()
-
+                with _spawn_streaming(session_id, cwd, message, images, job.job_id) as proc:
+                    # Claude's stdout is read on its own thread into the
+                    # turn's live run, so the turn keeps publishing after
+                    # this client disconnects and a phone can attach again.
                     def _reader() -> None:
                         try:
                             for raw in proc.stdout:
-                                lines.put(raw)
+                                _publish_line(run, raw)
                         finally:
-                            lines.put(STDOUT_EOF)
                             # Cleared when CLAUDE exits, not when the HTTP
-                            # request ends — so a disconnected client can
-                            # poll status and see the turn is still running.
+                            # request ends, so status still says running.
                             _end_resume(session_id)
 
                     threading.Thread(target=_reader, daemon=True).start()
                     spawned = True
-
-                    while True:
-                        try:
-                            raw = lines.get(timeout=10)
-                        except queue.Empty:
-                            yield ": keepalive\n\n"  # SSE comment — clients ignore it
-                            continue
-                        if raw is STDOUT_EOF:
-                            break
-                        line = raw.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        chunk = _text_delta(event)
-                        if chunk:
-                            yield _sse("text", {"chunk": chunk})
-                            continue
-                        # Full assistant message → surface its tool steps
-                        # (text already streamed via deltas above).
-                        if event.get("type") == "assistant":
-                            _, tools = _assistant_blocks(event.get("message", {}).get("content"))
-                            for t in tools:
-                                yield _sse("tool", {"name": t.name, "label": t.label, "stat": t.stat})
+                    # The whole turn from its first event, with keepalives
+                    # during the long silent start of a big session.
+                    yield from _follow_sse(run, start=0)
             except FileNotFoundError as err:
                 yield _sse("error", {"message": f"could not spawn claude: {err}"})
                 return
@@ -644,8 +756,21 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _queued_sse(
+    session_id: str, cwd: str, message: str, images: list, preview: str, reason: str, *, voice: bool
+) -> Iterator[str]:
+    """Queue a held message and tell the phone why, instead of starting a
+    second copy of a session that is working in a terminal tab (or going
+    past the running-turn cap). The queue runs it once that clears."""
+    depth = _enqueue(session_id, cwd, message, images, preview, voice=voice)
+    log.info("resume_stream.held", session_id=session_id, reason=reason, queued=depth)
+    yield _sse("queued", {"reason": reason, "queued": depth, "message": _HOLD_MESSAGES[reason]})
+    yield _sse("done", {"session_id": session_id})
+
+
 def _voice_stream_response(
-    session_id: str, cwd: str, message: str, images: list[ImageAttachment]
+    session_id: str, cwd: str, message: str, images: list[ImageAttachment],
+    preview: str, force: bool = False,
 ) -> StreamingResponse:
     """Voice-mode variant of the resume stream. The run is blocking (the
     schema guarantee is incompatible with token streaming), so the claude
@@ -656,8 +781,12 @@ def _voice_stream_response(
     in-flight marker when the PROCESS exits, not when the request ends."""
 
     def gen() -> Iterator[str]:
-        if not _try_start_resume(session_id):
-            yield _sse("error", {"message": "this session is already processing a message"})
+        reason = _claim(session_id, force=force)
+        if reason == "busy":
+            yield _sse("error", {"message": _HOLD_MESSAGES[reason]})
+            return
+        if reason is not None:
+            yield from _queued_sse(session_id, cwd, message, images, preview, reason, voice=True)
             return
         outcome: "queue.Queue" = queue.Queue()
 
@@ -749,8 +878,44 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
     preview = _preview(message, body.images, body.files)
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
-    depth = _enqueue(session_id, cwd, message, body.images, preview, voice=body.voice)
+    depth = _enqueue(
+        session_id, cwd, message, body.images, preview, voice=body.voice, force=body.force
+    )
     return {"ok": True, "session_id": session_id, "queued": depth}
+
+
+@router.post("/sessions/{session_id}/resume/queue/release")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def release_queue(request: Request, session_id: str) -> dict[str, Any]:
+    """"Send anyway": the session's queued messages stop waiting for the
+    terminal tab and the running-turn cap. They still run one at a time,
+    after any bridge turn already running on this session."""
+    with _queue_guard:
+        items = _queues.get(session_id) or []
+        for item in items:
+            item["force"] = True
+    log.info("resume_queue.released", session_id=session_id, count=len(items))
+    return {"ok": True, "session_id": session_id, "released": len(items)}
+
+
+@router.get("/sessions/{session_id}/resume/attach")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def attach_resume(request: Request, session_id: str):
+    """Watch a running turn again after the phone left the chat or iOS
+    dropped its stream. Fetch ``/messages`` first: finished messages are
+    in the transcript, so this replays only the message claude is writing
+    now, then streams the rest of the turn live with the same ``text`` and
+    ``tool`` events as /resume/stream, keepalives while quiet, and
+    ``done`` when the turn ends. Queued turns stream here too; voice and
+    blocking turns only send ``done``. Nothing running: ``done`` at once."""
+    run = live_runs.get(session_id)
+
+    def gen() -> Iterator[str]:
+        if run is not None:
+            yield from _follow_sse(run)
+        yield _sse("done", {"session_id": session_id})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @router.get("/sessions/{session_id}/resume/status")
@@ -758,17 +923,26 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
 def resume_status(request: Request, session_id: str) -> dict[str, Any]:
     """In-flight state for the mobile client's catch-up loop (the bridge's
     ``activeExecution``). ``running`` = a turn is generating now; ``queued``
-    = messages waiting to run. The client stays in "busy/syncing" and keeps
+    = messages waiting to run; ``held`` = why they wait; ``terminal`` = a
+    terminal tab holding the session and whether it is working. The client stays in "busy/syncing" and keeps
     pulling the transcript while ``running or queued``; when BOTH are empty
     the conversation has fully advanced. Cheap in-memory read — safe to
     poll."""
     started = _resume_started_at(session_id)
     queued = _queued(session_id)
+    with _queue_guard:
+        held = _holds.get(session_id) if queued else None
+    state = _terminal(session_id)
     return {
         "running": started is not None,
         "started_at": started,
         "queued": queued,
         "queue_count": len(queued),
+        # Why queued messages wait: "terminal" (working in a terminal tab)
+        # or "limit" (the running-turn cap), else None.
+        "held": held,
+        # Another live copy of the session, usually a terminal tab.
+        "terminal": state.as_dict() if state else None,
     }
 
 

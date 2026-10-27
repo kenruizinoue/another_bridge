@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A phone message to a session that is working in a terminal tab waits in
+  the queue instead of starting a second copy of the session. "Working"
+  means the tab is busy, or its own lines or its agents changed in the
+  last 120 s (`ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS`). `/resume/stream`
+  answers with a `queued` event and `done`; `/resume` answers 409.
+- At most 2 phone turns run at once across sessions
+  (`ANOTHER_BRIDGE_MAX_RUNNING_TURNS`); more wait in the queue.
+- "Send anyway": `"force": true` on a send, or
+  `POST /sessions/{id}/resume/queue/release` for what is already queued.
+- `terminal` on `/sessions` cards and `/resume/status`, and `held` on
+  `/resume/status`.
+- `scripts/terminal_catch_up.py`, a Claude Code `UserPromptSubmit` hook
+  that catches a terminal tab up on phone turns it hasn't seen, like
+  /sync-mobile, once per turn.
+
+- `GET /sessions/{id}/resume/attach`: a phone that left the chat (or was
+  frozen by iOS) watches the rest of a running turn stream in live. Every
+  resume path now publishes its `text` and `tool` events to an in-memory
+  live run, whether or not a phone is connected. Matching client change
+  in another_bridge_mobile 1.5.0.
+
+- Read-only Files for the phone: `GET /files/roots`, `GET /files/list`,
+  `GET /files/raw` (Range requests, so videos stream) and
+  `GET /files/locate`. Only the folders named in
+  `ANOTHER_BRIDGE_FILE_ROOTS` are reachable, by root name and relative
+  path. Hidden and key files are never listed or served. Matching client
+  change in another_bridge_mobile 1.4.0.
+- `GuardMiddleware` checks the key before any request body is read and
+  caps bodies at 40 MB on the resume routes and 64 KB elsewhere (413).
+  Ten failed key checks in a minute from one address get 429.
+- A separate phone key, `ANOTHER_BRIDGE_PHONE_KEY`. The phone routes no
+  longer accept `ANOTHER_CODER_API_KEY`, which now opens only the
+  AnotherAgent routes. `/auth/verify` takes either key.
+
+### Changed
+
+- The fallback model for phone turns (`ANOTHER_CODER_RESUME_MODEL`) is now
+  `claude-opus-5-5` instead of `claude-opus-4-8`. It applies only to
+  sessions with no model recorded; others keep their last model.
+- Queued text turns (`/resume/queue`) stream like a live send, so a phone
+  can attach to them. They are no longer cut off after 300 s.
+- The server refuses to start when a key is shorter than 32 characters,
+  when both keys are the same, or when a file root is invalid.
+- A key header with non-ASCII characters gets 401 instead of 500.
+- `/docs`, `/redoc`, `/openapi.json` and unknown paths now need the
+  AnotherAgent key.
+- Images on the resume routes are capped at about 10 MB each (422).
+
 ## [0.3.0] - 2026-07-29
 
 ### Added

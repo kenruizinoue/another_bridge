@@ -521,6 +521,10 @@ class SessionIndex:
                 return path
         return None
 
+    def transcript_path(self, session_id: str) -> Optional[Path]:
+        """The session's ``.jsonl`` file, or None when no file matches."""
+        return self._path_for(session_id)
+
     def latest_model(self, session_id: str) -> Optional[str]:
         """The model the session most recently ran on, or None if unknown.
         mtime-cached so a resume on a huge transcript doesn't re-scan."""

@@ -17,9 +17,11 @@ from fastapi import Depends, FastAPI
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from auth import verify_api_key
-from config import CLAUDE_MODEL
-from routers import auth as auth_router, chat, github, health, implementation, jobs, planning, repos, sessions, tts
+from auth import validate_keys, verify_any_key, verify_api_key, verify_phone_key
+from config import ANOTHER_BRIDGE_FILE_ROOTS, CLAUDE_MODEL
+from routers import auth as auth_router, chat, files, github, health, implementation, jobs, planning, repos, sessions, tts
+from services.file_roots import FileBrowser, parse_roots
+from services.guard import GuardMiddleware
 from services.claude_runner import probe_claude_binary
 from services.rate_limiter import limiter
 from services.reaper import build_default_reaper
@@ -39,7 +41,11 @@ log = structlog.get_logger()
 # none of our tests bind to ``main.app`` for that reason.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    log.info("server.started", model=CLAUDE_MODEL)
+    # Unsafe keys or a bad file root stop the boot here, before the
+    # server accepts a request. Neither error ever includes a key value.
+    validate_keys()
+    _app.state.file_browser = FileBrowser(parse_roots(ANOTHER_BRIDGE_FILE_ROOTS))
+    log.info("server.started", model=CLAUDE_MODEL, file_roots=[r["name"] for r in _app.state.file_browser.roots()])
     # Operator UX: probe `claude --version` at boot so a missing /
     # broken CLI surfaces in the startup log rather than at first
     # chat (where it would surface as a generic ``spawn_failed``
@@ -79,6 +85,9 @@ app = FastAPI(lifespan=lifespan)
 # so a CORS policy would be misleading.
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+# Added last so it runs first: the key check and size caps happen before
+# rate limiting, routing or any body read. See services/guard.py.
+app.add_middleware(GuardMiddleware)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -97,25 +106,27 @@ async def _rate_limit_exceeded_handler(_request, exc: RateLimitExceeded):
 # needing the bridge secret.
 app.include_router(health.router)
 
-# Auth-gated routers. `dependencies=[Depends(verify_api_key)]` runs the
-# header check before any handler in the router fires; missing /
-# mismatched key returns 401 without ever entering the handler. Applied
-# at the include level so router files stay free of auth wiring and
-# new routes inherit the gate by default.
+# Auth-gated routers. GuardMiddleware already checked the key for the
+# route's surface; these per-router dependencies repeat the check as a
+# second layer. Phone routes take the phone key, the AnotherAgent
+# routes take the AnotherAgent key.
 _authed = [Depends(verify_api_key)]
-# Auth probe — Settings → Integrations → another_coder Connect calls
-# /auth/verify before saving the key, so a wrong key fails fast at
-# Connect time instead of silently surfacing 401s on the next chat.
-app.include_router(auth_router.router, dependencies=_authed)
+_phone = [Depends(verify_phone_key)]
+# Auth probe: the phone and the AnotherAgent Connect dialog both call
+# /auth/verify before saving a key, so it accepts either key.
+app.include_router(auth_router.router, dependencies=[Depends(verify_any_key)])
 app.include_router(jobs.router, dependencies=_authed)
 app.include_router(github.router, dependencies=_authed)
 app.include_router(repos.router, dependencies=_authed)
 # Session browsing — GET /sessions[/{id}] serves the mobile card list
 # from the on-disk Claude Code transcript tree (read-only; no resume).
-app.include_router(sessions.router, dependencies=_authed)
+app.include_router(sessions.router, dependencies=_phone)
 # Speech synthesis proxy — POST /tts forwards to the local Kokoro
 # OpenAI-compatible endpoint for the mobile voice conversation mode.
-app.include_router(tts.router, dependencies=_authed)
+app.include_router(tts.router, dependencies=_phone)
+# Read-only files for the phone's Files view, limited to the folders in
+# ANOTHER_BRIDGE_FILE_ROOTS. See services/file_roots.py.
+app.include_router(files.router, dependencies=_phone)
 app.include_router(planning.router, dependencies=_authed)
 app.include_router(implementation.router, dependencies=_authed)
 # Chat streaming bridge — POST /chat/stream forwards a turn to a local
