@@ -382,6 +382,18 @@ def _resume_started_at(session_id: str) -> float | None:
         return _running_resumes.get(session_id)
 
 
+def _running_elsewhere(session_id: str) -> list[dict[str, str]]:
+    """The other sessions running a phone turn now, by title, oldest first,
+    so a message held by the cap can say what it waits for."""
+    with _running_guard:
+        others = sorted((t, sid) for sid, t in _running_resumes.items() if sid != session_id)
+    named = []
+    for _, sid in others:
+        card = session_index.get_card(sid)
+        named.append({"session_id": sid, "title": (card or {}).get("title") or sid[:8]})
+    return named
+
+
 # ── Server-side send queue ────────────────────────────────────────────
 # Messages sent while a turn is in flight are queued HERE (not on the
 # phone), so the conversation keeps advancing even if the app is locked
@@ -941,6 +953,9 @@ def resume_status(request: Request, session_id: str) -> dict[str, Any]:
         # Why queued messages wait: "terminal" (working in a terminal tab)
         # or "limit" (the running-turn cap), else None.
         "held": held,
+        # For "limit": the sessions holding the slots, so the phone can name
+        # them instead of a vague "other turns".
+        "held_by": _running_elsewhere(session_id) if held == "limit" else [],
         # Another live copy of the session, usually a terminal tab.
         "terminal": state.as_dict() if state else None,
     }

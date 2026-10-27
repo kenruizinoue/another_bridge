@@ -12,10 +12,12 @@ phone copy restarted the terminal's reviewer agents a second time.
 
 This module answers one question for the router: is another live copy of
 the session working right now? It counts as working when its status is
-"busy", or when its own lines (matched by its ``entrypoint``) or its
-agents' transcripts changed within ``active_seconds``. "busy" alone is
-not enough: a terminal whose turn ended stays "idle" while its background
-agents keep running. The bridge's own ``claude`` children never count.
+"busy", when its own lines (matched by its ``entrypoint``) changed within
+``line_seconds``, or when its agents' transcripts changed within
+``active_seconds``. "busy" alone is not enough: a terminal whose turn
+ended stays "idle" while its background agents keep running. Its own
+lines get the short window only, so a quick terminal turn (a /compact)
+holds the phone for seconds, not minutes. The bridge's own ``claude`` children never count.
 
 Anything unreadable fails open (no state), so a format change in Claude
 Code degrades to the old behavior instead of a queue that never drains.
@@ -37,6 +39,7 @@ import structlog
 from config import (
     ANOTHER_BRIDGE_CLAUDE_SESSIONS_DIR,
     ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS,
+    ANOTHER_BRIDGE_TERMINAL_LINE_SECONDS,
 )
 
 log = structlog.get_logger()
@@ -134,9 +137,11 @@ class TerminalWatch:
         sessions_dir: Path,
         active_seconds: int = ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS,
         own_pid: Optional[int] = None,
+        line_seconds: int = ANOTHER_BRIDGE_TERMINAL_LINE_SECONDS,
     ) -> None:
         self.sessions_dir = sessions_dir
         self.active_seconds = active_seconds
+        self.line_seconds = line_seconds
         self._own_pid = own_pid
         self._warned = False
 
@@ -189,7 +194,7 @@ class TerminalWatch:
             agents = 0
             if transcript is not None:
                 newest = _newest_line_time(transcript, entrypoint)
-                recent = newest is not None and now - newest <= self.active_seconds
+                recent = newest is not None and now - newest <= self.line_seconds
                 agents = self._active_agents(transcript, entrypoint, now)
             return TerminalState(
                 pid=int(rec["pid"]), entrypoint=entrypoint, busy=busy,

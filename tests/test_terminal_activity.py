@@ -98,6 +98,26 @@ def test_idle_terminal_with_a_recent_line_is_active(tmp_path: Path) -> None:
     assert state is not None and state.active
 
 
+def test_a_finished_terminal_turn_frees_the_phone_after_the_line_window(tmp_path: Path) -> None:
+    # A /compact ended 60 s ago and the tab is idle: past the 20 s line
+    # window, so the phone sends straight away (120 s queued every chat
+    # Ken had just touched in a terminal).
+    _record(tmp_path / "sessions", "s1")
+    transcript = tmp_path / "proj" / "s1.jsonl"
+    _append(transcript, "cli", seconds_ago=60)
+    state = TerminalWatch(tmp_path / "sessions", own_pid=1).state("s1", transcript)
+    assert state is not None and not state.active
+
+
+def test_agents_keep_the_longer_window(tmp_path: Path) -> None:
+    _record(tmp_path / "sessions", "s1")
+    transcript = tmp_path / "proj" / "s1.jsonl"
+    _append(transcript, "cli", seconds_ago=60)
+    _append(transcript.parent / "s1" / "subagents" / "agent-a.jsonl", "cli", seconds_ago=60)
+    state = TerminalWatch(tmp_path / "sessions", own_pid=1).state("s1", transcript)
+    assert state is not None and state.active and state.agents == 1
+
+
 def test_the_bridges_own_lines_do_not_count(tmp_path: Path) -> None:
     # A phone turn just wrote (sdk-cli); the terminal's last line is old.
     _record(tmp_path / "sessions", "s1")
@@ -267,10 +287,19 @@ def test_the_running_turn_cap_queues_extra_turns(
         body = _stream(client, message="third turn")
         assert '"reason": "limit"' in body
         assert _wait(lambda: client.get("/sessions/sess-1/resume/status").json()["held"] == "limit")
+        # It names what it waits for (an unknown id falls back to its start).
+        held_by = client.get("/sessions/sess-1/resume/status").json()["held_by"]
+        assert held_by == [{"session_id": "another-session", "title": "another-"}]
         assert ran == []
     finally:
         sessions_router._end_resume("another-session")
     assert _wait(lambda: ran == ["third turn"])
+
+
+def test_the_default_cap_is_three() -> None:
+    from config import Settings
+
+    assert Settings.model_fields["another_bridge_max_running_turns"].default == 3
 
 
 def test_cards_show_the_terminal(client: TestClient, terminal) -> None:  # noqa: F811

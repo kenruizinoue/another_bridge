@@ -44,7 +44,7 @@ can turn into a command line option. After this pass:
     agents ... propose a fix", then "implement it, do not install until i
     say so"). A phone message to a session that is working in a terminal
     tab waits in the bridge's queue instead of starting a second copy. At
-    most 2 phone turns run at once. "Send anyway" skips both. A hook
+    most 3 phone turns run at once (2 at first, raised the same day). "Send anyway" skips both. A hook
     catches terminal tabs up on phone turns, and every session only
     messages its own agents (playbook rule).
 
@@ -84,7 +84,8 @@ can turn into a command line option. After this pass:
     `{"open", "busy", "active", "agents"}` for a live terminal tab holding
     the session. `active` means it is working now.
   - `/resume/status` carries `held`: `"terminal"`, `"limit"` or `null`, why
-    queued messages wait.
+    queued messages wait, and `held_by`: the `{"session_id", "title"}` of the
+    sessions holding the slots when it is `"limit"`.
   - `/resume/stream` (text and voice) answers a held send with an SSE
     `queued` event, `{"reason", "queued", "message"}`, then `done`. The
     queue runs it later. `/resume` answers 409.
@@ -624,7 +625,8 @@ TDD work:
   open. Routes: a held stream queues with a `queued` event; a quiet
   terminal tab doesn't hold; `force` and `/resume/queue/release` run it;
   `/resume/queue` waits too; `/resume` gives 409; voice turns queue; the
-  cap of 2 running turns holds a third; cards show `terminal`.
+  cap holds the next turn and names the sessions holding it; cards show
+  `terminal`.
 - `scripts/terminal_catch_up.py`, a `UserPromptSubmit` hook for terminal
   tabs: hands over the phone turns the tab hasn't seen, once, capped at
   30 turns, with images saved like /sync-mobile.

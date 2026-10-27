@@ -506,6 +506,7 @@ class TestResume:
             "queued": [],
             "queue_count": 0,
             "held": None,
+            "held_by": [],
             "terminal": None,
         }
         assert sessions_router._try_start_resume("sess-1") is True

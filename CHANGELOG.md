@@ -13,8 +13,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
   means the tab is busy, or its own lines or its agents changed in the
   last 120 s (`ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS`). `/resume/stream`
   answers with a `queued` event and `done`; `/resume` answers 409.
-- At most 2 phone turns run at once across sessions
-  (`ANOTHER_BRIDGE_MAX_RUNNING_TURNS`); more wait in the queue.
+- A terminal tab whose turn ended counts as working for only 20 s after
+  its own last line (`ANOTHER_BRIDGE_TERMINAL_LINE_SECONDS`); its agents
+  keep the 120 s window. With 120 s for both, every chat Ken had just
+  touched in a terminal (a /compact, a /sync-mobile) queued phone messages
+  for 2 minutes, so the queue seemed to follow him between chats.
+- At most 3 phone turns run at once across sessions
+  (`ANOTHER_BRIDGE_MAX_RUNNING_TURNS`); more wait in the queue, and
+  `/resume/status` names the sessions holding the slots in `held_by`.
+  The first default of 2 held a quick message behind a half-hour reel
+  build and an audit in two other sessions.
 - "Send anyway": `"force": true` on a send, or
   `POST /sessions/{id}/resume/queue/release` for what is already queued.
 - `terminal` on `/sessions` cards and `/resume/status`, and `held` on

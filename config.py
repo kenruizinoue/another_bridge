@@ -94,10 +94,19 @@ class Settings(BaseSettings):
     # in a terminal tab: its status is busy, or its lines or its agents
     # changed within this many seconds.
     another_bridge_terminal_active_seconds: int = Field(default=120, ge=10)
+    # A tab whose turn ended (status idle) still counts as working this many
+    # seconds after its own last line, to bridge the gap before a finished
+    # agent's notice starts its next turn. Its agents use the longer window
+    # above. 120 s here made every chat Ken had just touched in a terminal
+    # (a /compact, a /sync-mobile) queue phone messages for 2 minutes
+    # (October 27, 2026).
+    another_bridge_terminal_line_seconds: int = Field(default=20, ge=5)
     # Phone turns running at once across all sessions; more wait in the
     # queue. Several big sessions at once used up the plan's 5-hour limit
-    # in about 90 minutes on October 26, 2026.
-    another_bridge_max_running_turns: int = Field(default=2, ge=1)
+    # in about 90 minutes on October 26, 2026. 2 was too few: one reel
+    # build holds a slot for half an hour, so a quick message to a third
+    # session waited on two unrelated ones (October 27, 2026).
+    another_bridge_max_running_turns: int = Field(default=3, ge=1)
     # Claude Code's per-process files (pid, sessionId, status). Empty means
     # <claude-config>/sessions, next to the projects folder.
     another_bridge_claude_sessions_dir: str = ""
@@ -236,6 +245,7 @@ def _resolve_claude_projects_dir() -> Path:
 CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
 
 ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS: int = settings.another_bridge_terminal_active_seconds
+ANOTHER_BRIDGE_TERMINAL_LINE_SECONDS: int = settings.another_bridge_terminal_line_seconds
 ANOTHER_BRIDGE_MAX_RUNNING_TURNS: int = settings.another_bridge_max_running_turns
 ANOTHER_BRIDGE_CLAUDE_SESSIONS_DIR: Path = (
     Path(settings.another_bridge_claude_sessions_dir).expanduser()
