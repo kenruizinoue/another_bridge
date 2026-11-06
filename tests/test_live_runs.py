@@ -160,14 +160,9 @@ def test_stream_endpoint_publishes_what_it_streams(
 
     monkeypatch.setattr(sessions_router.live_runs, "start", spy_start)
 
-    class FakeProc:
-        stdout = [f"{_delta('hi')}\n", f"{_tool_message('look around')}\n"]
+    from tests import fake_turns
 
-    @contextlib.contextmanager
-    def fake_stream(args, cwd, job_id):
-        yield FakeProc()
-
-    monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+    fake_turns.install(monkeypatch, sessions_router, [f"{_delta('hi')}\n", f"{_tool_message('look around')}\n"])
     with client.stream("POST", "/sessions/sess-1/resume/stream", json={"message": "hi"}) as r:
         body = "".join(r.iter_text())
 
@@ -184,26 +179,22 @@ def test_queued_turns_stream_their_events_and_have_no_short_deadline(
     published: list = []
     real_publish = sessions_router._publish_line
 
-    def spy_publish(run, raw):
+    def spy_publish(run, raw, inp=None):
         published.append(raw.strip())
-        real_publish(run, raw)
+        real_publish(run, raw, inp)
 
     monkeypatch.setattr(sessions_router, "_publish_line", spy_publish)
 
-    @contextlib.contextmanager
-    def fake_stream(args, cwd, job_id):
+    from tests import fake_turns
+
+    def check(args, cwd):
         assert "--include-partial-messages" in args and "stream-json" in args
-        ran.append(args[args.index("-p") + 1])
 
-        class P:
-            stdout = [f"{_delta('queued reply')}\n"]
-
-        yield P()
+    fake_turns.install(monkeypatch, sessions_router, [f"{_delta('queued reply')}\n"], sink=ran, on_spawn=check)
 
     def no_blocking(*_a, **_k):
         raise AssertionError("text turns in the queue must stream, not block")
 
-    monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
     monkeypatch.setattr(sessions_router.claude_runner, "run_blocking", no_blocking)
 
     client.post("/sessions/sess-1/resume/queue", json={"message": "first"})

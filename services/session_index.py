@@ -8,9 +8,11 @@ anything. It is the ``GET /sessions`` data source.
 
 Two properties matter for a 1,000+ file home directory:
 
-  * **Cheap list sort.** Last-activity ordering uses the file's mtime,
-    not a full parse — the OS already tracks it and an append bumps it,
-    so it's an accurate "last touched" proxy for free.
+  * **Honest list sort.** Last-activity ordering uses the time of the
+    last real message, read during the card parse (which is cached). The
+    file's mtime is not used for it: open Claude Code tabs touch their
+    transcripts without a new turn, so mtime said a session idle for two
+    days was used 41 minutes ago (2026-11-04).
 
   * **mtime-keyed cache.** Parsing a transcript for its title / cwd /
     message count means reading the file. We cache the parsed card
@@ -29,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -104,7 +107,7 @@ class SessionCard:
     project: str  # human label — basename of cwd, else the encoded dir
     message_count: int  # human turns + assistant turns only
     created_at: Optional[str]  # ISO8601 from the first event, if present
-    last_activity: float  # file mtime, epoch seconds (list sort key)
+    last_activity: float  # last real message, epoch seconds (list sort key)
     size_bytes: int
 
 
@@ -125,6 +128,18 @@ def _first_text(content) -> Optional[str]:
     return None
 
 
+def _event_time(event: dict) -> Optional[float]:
+    """An event's ISO8601 ``timestamp`` as epoch seconds, None if absent or
+    malformed."""
+    ts = event.get("timestamp")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _clean_title(text: str) -> Optional[str]:
     text = text.strip()
     if not text or text.startswith(_SKIP_TEXT_PREFIXES):
@@ -138,11 +153,19 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
     Returns None for an empty / unreadable / contentless file so the
     caller can drop it rather than surface a blank card.
 
-    Title precedence: the ``ai-title`` event Claude Code generates >
-    a ``summary`` record > the first real user message > a fallback.
-    We scan the whole file because ``ai-title`` is emitted after the
-    first turn, but the files are small and the result is cached."""
+    Title precedence: the latest ``custom-title`` (``-n`` / ``/rename``)
+    > the latest ``ai-title`` Claude Code generates > a ``summary`` record
+    > the first real user message > a fallback. Claude Code re-appends its
+    title events on every turn, so the newest one is the current name.
+
+    ``last_activity`` is the time of the last real message (user or
+    assistant, not a subagent, an injected meta turn or a compaction
+    summary). The file's mtime is only the fallback: open Claude Code tabs
+    touch their transcripts without a new turn (2026-11-04), so mtime said
+    "41 min ago" on a session last used two days earlier."""
+    custom_title: Optional[str] = None
     ai_title: Optional[str] = None
+    last_message_at: Optional[float] = None
     summary: Optional[str] = None
     first_user_text: Optional[str] = None
     cwd: Optional[str] = None
@@ -168,8 +191,10 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
                 if cwd is None and event.get("cwd"):
                     cwd = event.get("cwd")
 
-                if etype == "ai-title" and not ai_title:
-                    ai_title = event.get("aiTitle") or event.get("title")
+                if etype == "custom-title":
+                    custom_title = _clean_title(str(event.get("customTitle") or "")) or custom_title
+                elif etype == "ai-title":
+                    ai_title = _clean_title(str(event.get("aiTitle") or event.get("title") or "")) or ai_title
                 elif etype == "summary" and not summary:
                     summary = event.get("summary")
                 elif etype == "user":
@@ -178,6 +203,7 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
                     # human turns — excluded from the count and the title.
                     if event.get("isSidechain") or event.get("isMeta") or event.get("isCompactSummary"):
                         continue
+                    last_message_at = _event_time(event) or last_message_at
                     message_count += 1
                     if first_user_text is None:
                         raw = _first_text(event.get("message", {}).get("content"))
@@ -185,12 +211,14 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
                             first_user_text = raw
                 elif etype == "assistant":
                     if not event.get("isSidechain"):
+                        last_message_at = _event_time(event) or last_message_at
                         message_count += 1
     except OSError:
         return None
 
     title = (
-        (ai_title and _clean_title(ai_title))
+        custom_title
+        or ai_title
         or (summary and _clean_title(summary))
         or (first_user_text and _clean_title(first_user_text))
         or "(untitled session)"
@@ -207,7 +235,7 @@ def _parse_transcript(path: Path) -> Optional[SessionCard]:
         project=project or path.parent.name,
         message_count=message_count,
         created_at=created_at,
-        last_activity=stat.st_mtime,
+        last_activity=last_message_at if last_message_at is not None else stat.st_mtime,
         size_bytes=stat.st_size,
     )
 

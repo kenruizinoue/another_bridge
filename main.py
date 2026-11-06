@@ -18,8 +18,9 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from auth import validate_keys, verify_any_key, verify_api_key, verify_phone_key
-from config import ANOTHER_BRIDGE_FILE_ROOTS, CLAUDE_MODEL
+from config import ANOTHER_BRIDGE_FILE_ROOTS, ANOTHER_BRIDGE_NEW_SESSION_CWD, ANOTHER_BRIDGE_TERMINAL_APP, CLAUDE_MODEL
 from routers import auth as auth_router, chat, files, github, health, implementation, jobs, planning, repos, sessions, tts
+from services import mac_terminal
 from services.file_roots import FileBrowser, parse_roots
 from services.guard import GuardMiddleware
 from services.claude_runner import probe_claude_binary
@@ -44,6 +45,7 @@ async def lifespan(_app: FastAPI):
     # Unsafe keys or a bad file root stop the boot here, before the
     # server accepts a request. Neither error ever includes a key value.
     validate_keys()
+    mac_terminal.validate_config(ANOTHER_BRIDGE_TERMINAL_APP, ANOTHER_BRIDGE_NEW_SESSION_CWD)
     _app.state.file_browser = FileBrowser(parse_roots(ANOTHER_BRIDGE_FILE_ROOTS))
     log.info("server.started", model=CLAUDE_MODEL, file_roots=[r["name"] for r in _app.state.file_browser.roots()])
     # Operator UX: probe `claude --version` at boot so a missing /

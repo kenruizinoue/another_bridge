@@ -8,6 +8,42 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Talk to a running phone turn (ticket 26). Every streamed phone turn
+  runs with an open stream-json stdin and `--replay-user-messages`.
+  `POST /sessions/{id}/resume/inject` writes a message into the running
+  turn; claude reads it at its next step (tested 2026-11-05) and the live
+  stream sends `steer` events (`sent`, then `read`). 409 when no running
+  turn can take it. The `result` closes stdin, so claude exits as before.
+- `POST /sessions/{id}/resume/stop` interrupts the running turn (a
+  `control_request` interrupt) and pauses the queue when messages wait;
+  `POST /sessions/{id}/resume/queue/run` resumes it.
+- Queued messages have ids. `DELETE /sessions/{id}/resume/queue/{item}`
+  (kept 10 minutes for `POST .../{item}/restore`, the phone's Undo),
+  `PATCH .../{item}` edits the text and keeps the files,
+  `POST .../{item}/send-now` sends it into the running turn when it can,
+  else first in line past any hold, and `POST .../queue/send-all-now`.
+- `/resume/status` carries `queue_items`, `can_inject`, `steers` and
+  `paused`; `held` can be `"paused"`.
+
+- `POST /sessions/new/stream` starts a new session from the phone. The
+  bridge picks its id, sends it in a first `session` event once the
+  transcript exists, then streams the turn like `/resume/stream`. An
+  optional `name` goes to `claude --name`. It runs in
+  `ANOTHER_BRIDGE_NEW_SESSION_CWD` (home by default). Ticket 25.
+- `POST /sessions/{id}/open-on-mac` opens the session in a new iTerm2 tab
+  (Terminal when iTerm2 isn't installed, `ANOTHER_BRIDGE_TERMINAL_APP`)
+  running `claude --dangerously-skip-permissions --resume <id>` in its
+  folder (`ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS=false` drops the flag).
+  While a phone turn writes the session it waits and opens when the turn
+  ends; `/resume/status` shows `opening_on_mac`. A session already open
+  in a tab answers `already_open`, including a tab still at Claude Code's
+  "trust this folder" question, which it asks in the home folder every
+  time. Ticket 25.
+- Every phone turn gets `--append-system-prompt` telling it to run long
+  work in the foreground: a headless `claude -p` stops its background
+  agents about 10 minutes after its reply, which stalled a reel on
+  2026-11-04. Ticket 24.
+
 - A phone message to a session that is working in a terminal tab waits in
   the queue instead of starting a second copy of the session. "Working"
   means the tab is busy, or its own lines or its agents changed in the
@@ -49,6 +85,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - A separate phone key, `ANOTHER_BRIDGE_PHONE_KEY`. The phone routes no
   longer accept `ANOTHER_CODER_API_KEY`, which now opens only the
   AnotherAgent routes. `/auth/verify` takes either key.
+
+### Fixed
+
+- Session cards show the time of the last real message, and the list
+  sorts by it. The file's mtime said "41 min ago" on a session idle for
+  two days, because open Claude Code tabs touch their transcripts with no
+  new turn. Ticket 22.
+- Session cards show the newest name: a `custom-title` from
+  `claude --name` or `/rename` first, else the latest `ai-title`.
+  Ticket 23.
 
 ### Changed
 

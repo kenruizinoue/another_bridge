@@ -92,6 +92,34 @@ can turn into a command line option. After this pass:
   - Request bodies take `"force": true` to skip both checks.
   - `POST /sessions/{id}/resume/queue/release` releases the queued
     messages ("Send anyway") and returns `{"released": n}`.
+- New sessions and Open on Mac (ticket 25, app 1.8.0):
+  - `POST /sessions/new/stream` takes `{"message", "images", "files",
+    "name", "force"}` and streams SSE: `session` `{"session_id", "cwd",
+    "name"}` once the transcript exists, then `text`, `tool` and `done`
+    like `/resume/stream`. The turn cap answers `error` with `"reason":
+    "limit"`. The phone may close the stream after `session`; the turn
+    keeps running and `/resume/attach` follows it.
+  - `POST /sessions/{id}/open-on-mac` returns `{"ok", "status", "app"}`:
+    `status` is `opened`, `waiting` or `already_open`, `app` is `iterm`
+    or `terminal`. 404, 422 (no folder) and 502 (osascript failed, with
+    its message in `detail`).
+  - `/resume/status` carries `opening_on_mac`.
+- Card fields (tickets 22 and 23): `last_activity` is the last real
+  message, `title` the newest custom or AI title. Same names and types.
+- A running turn and the queue (ticket 26, app 1.9.0):
+  - `POST /sessions/{id}/resume/inject` takes the `/resume` body and
+    returns `{"status": "sent_mid_turn", "id"}`, or 409.
+  - Live streams (`/resume/stream`, `/resume/attach`, new sessions) send
+    `steer` `{"id", "state": "sent" | "read", "text"?}`.
+  - `POST /sessions/{id}/resume/stop` returns `{"stopped", "paused"}`;
+    `POST /sessions/{id}/resume/queue/run` resumes a paused queue.
+  - `/resume/queue` returns the new item's `id`. `DELETE` and `PATCH
+    /sessions/{id}/resume/queue/{item}` (`{"message"}`), `POST
+    .../{item}/restore`, `POST .../{item}/send-now` returns `{"status":
+    "sent_mid_turn" | "next" | "starting"}`, `POST
+    .../queue/send-all-now` returns `{"sent": [{"id", "status"}]}`.
+  - `/resume/status` adds `queue_items` `[{"id", "preview", "text"}]`,
+    `can_inject`, `steers` `[{"id", "text", "state"}]`, `paused`.
 
 ## Status
 
@@ -118,6 +146,11 @@ can turn into a command line option. After this pass:
 | 19 | Read-only files for the phone | Done (2026-10-24) |
 | 20 | Re-attach to a running turn | Done (2026-10-26) |
 | 21 | One copy of a session at a time | Done, not deployed (2026-10-27) |
+| 22 | Card time from the last real message | Done (2026-11-05) |
+| 23 | Card title from the newest name | Done (2026-11-05) |
+| 24 | Phone turns run long work in the foreground | Done (2026-11-05) |
+| 25 | New session from the phone, Open on Mac | Done (2026-11-05) |
+| 26 | Talk to a running turn, queue actions | Done (2026-11-05) |
 
 ## Phase 1: stop the cheap attacks
 
@@ -646,6 +679,167 @@ Acceptance criteria:
 
 - 450 tests pass. The bridge restart, the hook in `~/.claude/settings.json`
   and app 1.6.0 go live only when Ken says to install.
+
+### Ticket 22 - Card time from the last real message
+
+Objective:
+
+- A session card says when Ken last used the session. On 2026-11-04 the
+  Nov/1 LunchyBox card said "41 min ago" two days after its last message:
+  the card used the transcript's mtime, and open Claude Code tabs touch
+  their transcripts with no new turn (every idle tab at 19:23:21 the same
+  second, right after the Mac woke, no bytes added). The list order used
+  the same time, so idle open tabs jumped to the top.
+
+TDD work:
+
+- Failing tests (`tests/test_session_cards.py`): `last_activity` is the
+  last user or assistant event's timestamp, not the file time; idle
+  compaction, its summary turn, meta turns, subagents and metadata lines
+  don't count; a tool result counts; no timestamps falls back to mtime;
+  the list sorts by it.
+- Then the code in `services/session_index.py`.
+
+Edge cases:
+
+- The field keeps its name and type, so the app needs no change.
+
+Acceptance criteria:
+
+- The tests pass; the card cache still keys on (mtime, size).
+
+### Ticket 23 - Card title from the newest name
+
+Objective:
+
+- A name set with `claude --name` or `/rename` shows on the phone. The
+  index took the first `ai-title` and ignored `custom-title`.
+
+TDD work:
+
+- Failing tests: the latest `custom-title` wins over any `ai-title`; the
+  latest `ai-title` wins over earlier ones; a blank custom title is
+  ignored.
+- Then the code.
+
+Acceptance criteria:
+
+- The tests pass.
+
+### Ticket 24 - Phone turns run long work in the foreground
+
+Objective:
+
+- Long work asked for from the phone finishes. On 2026-11-04 a reel
+  builder agent launched from a phone turn stopped ("[Request interrupted
+  by user]") exactly 10 minutes after the turn's reply. A Haiku test on
+  2026-11-05 showed the same: a headless `claude -p` waits about 10
+  minutes for its background tasks after the reply, then stops them and
+  exits. The bridge has no timer on the stream path, so the cut is Claude
+  Code's. The stream's `result` event also comes only at that exit.
+
+TDD work:
+
+- Failing tests: every phone turn (stream, blocking, voice, new session)
+  carries `--append-system-prompt` with `PHONE_TURN_NOTE`, which says to
+  run long work in the foreground, without `run_in_background`.
+- Then the code (`_phone_flags` in `routers/sessions.py`).
+
+Edge cases:
+
+- A foreground build holds one of the 3 turn slots for its whole run.
+- The phone streams a turn with no deadline, and re-attach covers a
+  dropped stream, so a long foreground turn is safe to watch.
+
+Acceptance criteria:
+
+- The tests pass. The next reel started from the phone runs to the end.
+
+### Ticket 25 - New session from the phone, Open on Mac
+
+Objective:
+
+- Ken starts a new session from the phone and continues it on the Mac,
+  and opens any session in a new Mac terminal tab from the phone.
+
+TDD work:
+
+- `services/mac_terminal.py`: the `cd <folder> && claude
+  --dangerously-skip-permissions --resume <id>` line (shell-quoted, id
+  shaped, no control characters), the iTerm2 script (new tab in the front
+  window, a new window when none is open, the line typed into the shell),
+  the Terminal script, the app choice (`auto` prefers iTerm2 and falls
+  back to Terminal), osascript errors, and the boot check of the settings.
+- `POST /sessions/new/stream`: the bridge picks the id
+  (`--session-id`), passes `--name`, runs in
+  `ANOTHER_BRIDGE_NEW_SESSION_CWD`, and sends a `session` event once the
+  transcript exists (so the phone can open the chat and attach to the
+  first turn), then the usual events. The turn cap refuses it with
+  `error` reason `limit`; `force` passes it.
+- `POST /sessions/{id}/open-on-mac`: `opened`, `waiting` (a phone turn is
+  writing the session or messages are queued; it opens when they end,
+  once, within `ANOTHER_BRIDGE_OPEN_WAIT_SECONDS`), or `already_open` (a
+  terminal copy holds it). 404, 422 (no folder), 502 (osascript failed).
+  `/resume/status` shows `opening_on_mac`.
+
+Edge cases:
+
+- The first tap on a Mac may need macOS to allow the bridge to control
+  iTerm2 or Terminal (Settings, Privacy and Security, Automation); until
+  then the tap answers 502 with osascript's message.
+- The command is typed into the tab's shell, so Ken's PATH applies and
+  the tab stays open after claude exits.
+- Claude Code never saves folder trust for the home folder, so a tab
+  opened there starts at "trust this folder" (default "No, exit"), like
+  any `claude` started there by hand. Until it is answered the process
+  has no `sessions/<pid>.json` record, so the first live check opened a
+  second tab on a second tap. `already_open` now also counts any
+  `--resume <id>` process that isn't the bridge's own child.
+
+Acceptance criteria:
+
+- 516 tests pass. Manual check on 2026-11-05 through the tunnel: a new
+  session started (`session`, `text`, `done` in 6 s) with its name on the
+  card; Open on Mac opened an iTerm2 tab with no macOS permission prompt;
+  a session open in a tab answered `already_open`.
+
+### Ticket 26 - Talk to a running turn, queue actions
+
+Objective:
+
+- A message Ken sends while Claude works can go into the running turn
+  (to update or take back what he asked), or wait in the queue as
+  before. Queued messages can be sent now, deleted (with Undo) or edited,
+  and a running turn can be stopped.
+
+TDD work:
+
+- `services/turn_input.py`: the stream-json first message, a message
+  sent mid-turn (recorded before the write so its echo can't come
+  first), `read` on claude's echo, the interrupt line, nothing written
+  after close or a broken pipe.
+- Routes (`tests/test_turn_input_and_queue.py`, with a fake turn that
+  runs until the test ends it): inject while running, 409 after the
+  `result` and when nothing runs; Stop interrupts and pauses the queue,
+  Run queue resumes it; ids, Delete and Undo, Edit keeps files; Send now
+  into the running turn and past a terminal hold; Send all now in order.
+- `tests/conftest.py` refuses a real `streaming_subprocess_open` in any
+  test, since a phone turn runs with `--dangerously-skip-permissions`.
+
+Edge cases:
+
+- Before building, a Haiku test checked the CLI: a message written
+  while a 15 s command ran was read right after it and the one reply
+  included it; an interrupt ended the turn at once.
+- A message sent as the turn ends is either read as the next turn by
+  the same process (written before stdin closed) or refused with 409 and
+  queued by the phone. Nothing is lost.
+- Voice (schema) and blocking turns keep the closed stdin: they can't
+  take messages or be stopped, and Send now puts the message next.
+
+Acceptance criteria:
+
+- 535 tests pass.
 
 ## Optional, not scheduled
 

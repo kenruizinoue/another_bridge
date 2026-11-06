@@ -336,3 +336,31 @@ def streaming_subprocess_stdin(
         yield proc
     finally:
         job_manager.detach_process(job_id)
+
+
+@contextmanager
+def streaming_subprocess_open(
+    args: list[str],
+    cwd: str,
+    job_id: str,
+) -> Iterator[subprocess.Popen]:
+    """Like streaming_subprocess_stdin, but writes nothing and leaves stdin
+    OPEN: the caller writes stream-json lines itself (the first message,
+    then messages sent mid-turn, or an interrupt) through
+    ``services.turn_input`` and closes stdin when the turn's ``result``
+    arrives, which lets claude exit (ticket 26)."""
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    job_manager.attach_process(job_id, proc)
+    try:
+        yield proc
+    finally:
+        job_manager.detach_process(job_id)

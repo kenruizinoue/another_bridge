@@ -147,6 +147,24 @@ the real defense.
 
 ---
 
+## Opening a terminal tab from the phone
+
+`POST /sessions/{id}/open-on-mac` runs `osascript` to open an iTerm2 tab
+or a Terminal window on the Mac. It never takes a command from the
+request: the line is always `cd <folder> && claude [--dangerously-skip-
+permissions] --resume <id>`, where the id must be a known session's
+filename shaped like an id and the folder is the one Claude Code recorded
+for it, shell-quoted, with control characters refused
+(`services/mac_terminal.py`). The route needs the phone key like every
+`/sessions` route. A leaked phone key can already run Claude with
+`--dangerously-skip-permissions` through `/resume`, so this adds no new
+power, only a visible tab on the Mac.
+
+`POST /sessions/new/stream` starts Claude only in
+`ANOTHER_BRIDGE_NEW_SESSION_CWD`, never in a folder from the request.
+
+---
+
 ## What the bridge does NOT defend
 
 ### Prompt injection

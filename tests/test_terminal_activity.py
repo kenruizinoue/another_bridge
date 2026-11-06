@@ -188,18 +188,10 @@ def terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 def ran(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Prompts claude was started with (no real claude ever runs)."""
+    from tests import fake_turns
+
     prompts: list[str] = []
-
-    @contextlib.contextmanager
-    def fake_stream(args, cwd, job_id):
-        prompts.append(args[args.index("-p") + 1])
-
-        class P:
-            stdout = ['{"type": "result"}\n']
-
-        yield P()
-
-    monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+    fake_turns.install(monkeypatch, sessions_router, sink=prompts)
     return prompts
 
 

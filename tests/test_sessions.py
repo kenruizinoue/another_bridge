@@ -383,15 +383,10 @@ class TestResume:
             json.dumps({"type": "result"}),
         ]
 
-        class FakeProc:
-            stdout = [f"{l}\n" for l in lines]
+        from tests import fake_turns
 
-        @contextlib.contextmanager
-        def fake_stream(args, cwd, job_id):
-            assert "--include-partial-messages" in args and "--resume" in args
-            yield FakeProc()
-
-        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+        calls: list = []
+        fake_turns.install(monkeypatch, sessions_router, [f"{l}\n" for l in lines], calls=calls)
 
         with client.stream("POST", "/sessions/sess-1/resume/stream", json={"message": "hi"}) as r:
             assert r.status_code == 200
@@ -402,6 +397,11 @@ class TestResume:
         assert '"chunk": "Hel"' in body and '"chunk": "lo"' in body
         assert "event: tool" in body and "Bash: list files" in body
         assert "event: done" in body
+        args = calls[0]["args"]
+        assert "--include-partial-messages" in args and "--resume" in args
+        assert "--replay-user-messages" in args
+        assert calls[0]["proc"].stdin.texts()[0] == "hi"  # the message goes on stdin
+        assert calls[0]["proc"].stdin.closed  # closed at the result, so claude exits
 
     def test_resume_stream_unknown_session_404(self, client: TestClient) -> None:
         assert client.post("/sessions/nope/resume/stream", json={"message": "hi"}).status_code == 404
@@ -417,16 +417,10 @@ class TestResume:
             json.dumps({"type": "result"}),
         ]
 
-        class FakeProc:
-            stdout = [f"{l}\n" for l in lines]
+        from tests import fake_turns
 
-        @contextlib.contextmanager
-        def fake_stdin(args, cwd, job_id, stdin_data):
-            captured["args"] = args
-            captured["stdin"] = stdin_data
-            yield FakeProc()
-
-        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess_stdin", fake_stdin)
+        calls: list = []
+        fake_turns.install(monkeypatch, sessions_router, [f"{l}\n" for l in lines], calls=calls)
 
         with client.stream(
             "POST",
@@ -437,8 +431,9 @@ class TestResume:
             body = "".join(r.iter_text())
 
         # routed through the stdin path with a stream-json image message
-        assert "--input-format" in captured["args"] and "stream-json" in captured["args"]
-        assert '"type": "image"' in captured["stdin"] and '"QUJD"' in captured["stdin"]
+        assert "--input-format" in calls[0]["args"] and "stream-json" in calls[0]["args"]
+        first = calls[0]["proc"].stdin.lines[0]
+        assert '"type": "image"' in first and '"QUJD"' in first
         assert "event: text" in body
 
     def test_resume_image_only_is_allowed(
@@ -447,14 +442,9 @@ class TestResume:
         # A message with no text but an image must NOT be rejected as empty.
         import contextlib
 
-        @contextlib.contextmanager
-        def fake_stdin(args, cwd, job_id, stdin_data):
-            class P:
-                stdout = ['{"type":"result"}\n']
+        from tests import fake_turns
 
-            yield P()
-
-        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess_stdin", fake_stdin)
+        fake_turns.install(monkeypatch, sessions_router, ['{"type":"result"}\n'])
         with client.stream(
             "POST",
             "/sessions/sess-1/resume/stream",
@@ -467,18 +457,10 @@ class TestResume:
         import contextlib
         import time as _t
 
-        ran: list[str] = []
+        from tests import fake_turns
 
-        @contextlib.contextmanager
-        def fake_stream(args, cwd, job_id):
-            ran.append(args[args.index("-p") + 1])  # the prompt
-
-            class P:
-                stdout = ['{"type": "result"}\n']
-
-            yield P()
-
-        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+        ran: list[str] = []  # each turn's message, as written to its stdin
+        fake_turns.install(monkeypatch, sessions_router, sink=ran)
 
         assert client.post("/sessions/sess-1/resume/queue", json={"message": "first"}).json()["queued"] >= 1
         assert client.post("/sessions/sess-1/resume/queue", json={"message": "second"}).json()["ok"] is True
@@ -508,6 +490,11 @@ class TestResume:
             "held": None,
             "held_by": [],
             "terminal": None,
+            "opening_on_mac": False,
+            "queue_items": [],
+            "can_inject": False,
+            "steers": [],
+            "paused": False,
         }
         assert sessions_router._try_start_resume("sess-1") is True
         try:
@@ -687,29 +674,19 @@ class TestFileAttachments:
     ) -> None:
         import time as _time
 
-        import contextlib
+        from tests import fake_turns
 
-        captured: dict = {}
-
-        @contextlib.contextmanager
-        def fake_stream(args, cwd, job_id):
-            captured["args"] = args
-
-            class P:
-                stdout = ['{"type": "result"}\n']
-
-            yield P()
-
-        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess", fake_stream)
+        prompts: list[str] = []
+        fake_turns.install(monkeypatch, sessions_router, sink=prompts)
         r = client.post(
             "/sessions/sess-1/resume/queue",
             json={"files": [{"name": "notes.md", "data": self.B64_HELLO}]},
         )
         assert r.status_code == 200
         for _ in range(50):  # wait for the drain worker
-            if captured.get("args"):
+            if prompts:
                 break
             _time.sleep(0.05)
-        prompt = " ".join(str(a) for a in captured["args"])
+        prompt = prompts[0]
         assert "Attached files saved on this Mac" in prompt
         assert "notes.md" in prompt

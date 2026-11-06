@@ -144,3 +144,16 @@ def tmp_git_repo(tmp_path: Path) -> Path:
     _run(["git", "push", "-u", "origin", "main"], work)
 
     return work
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_turns(monkeypatch):
+    """A phone turn in a test must never start a real claude (it would run
+    with --dangerously-skip-permissions). Tests that drive a turn install
+    a fake from tests/fake_turns.py, which replaces this."""
+    from services import claude_runner
+
+    def refuse(*_a, **_k):
+        raise AssertionError("a test started a real claude turn; install tests/fake_turns.py")
+
+    monkeypatch.setattr(claude_runner, "streaming_subprocess_open", refuse)

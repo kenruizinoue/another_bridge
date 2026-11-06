@@ -15,11 +15,13 @@ per-route slowapi limit keyed on the shared X-Coder-Key.
 import base64
 import binascii
 import json
+import os
 import queue
 import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,13 +32,17 @@ from pydantic import BaseModel, Field
 
 from config import (
     ANOTHER_BRIDGE_MAX_RUNNING_TURNS,
+    ANOTHER_BRIDGE_NEW_SESSION_CWD,
+    ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS,
+    ANOTHER_BRIDGE_OPEN_WAIT_SECONDS,
+    ANOTHER_BRIDGE_TERMINAL_APP,
     ANOTHER_CODER_ATTACHMENTS_DIR,
     ANOTHER_CODER_RATE_LIMIT_SESSIONS,
     ANOTHER_CODER_RESUME_MODEL,
     ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
 )
 from jobs import job_manager
-from services import claude_runner, live_runs, terminal_activity
+from services import claude_runner, live_runs, mac_terminal, terminal_activity, turn_input
 from services.rate_limiter import limiter
 from services.session_index import _assistant_blocks, session_index
 
@@ -121,6 +127,28 @@ class ResumeRequest(BaseModel):
     force: bool = False
 
 
+class NewSessionRequest(BaseModel):
+    """Body for starting a session from the phone (ticket 25): the first
+    message and/or attachments, like ``ResumeRequest``, plus an optional
+    name (passed to ``claude --name``; empty lets Claude Code title it).
+    Voice mode starts once the session exists."""
+
+    message: str = Field(default="", max_length=100_000)
+    images: list[ImageAttachment] = Field(default_factory=list, max_length=10)
+    files: list[FileAttachment] = Field(default_factory=list, max_length=MAX_FILES)
+    name: str = Field(default="", max_length=120)
+    # "Send anyway": start it even when the running-turn cap is reached.
+    force: bool = False
+
+
+def _clean_session_name(name: str) -> str:
+    """Collapsed whitespace; 422 on control characters (a name ends up in
+    the transcript and on the phone's card)."""
+    if any(ord(ch) < 32 for ch in name):
+        raise HTTPException(status_code=422, detail="the session name can't contain control characters")
+    return " ".join(name.split())
+
+
 # Schema for voice turns. Brevity and the no-code rule live in the field
 # descriptions because the structured-output validator does not support
 # minLength/maxLength constraints.
@@ -153,9 +181,30 @@ VOICE_SPEECH_SCHEMA_JSON = json.dumps(VOICE_SPEECH_SCHEMA)
 MAC_VOICE_TOOLS = "mcp__plugin_voicemode_voicemode__*,mcp__voicemode__*"
 
 
+# Every phone turn is a one-off headless `claude -p`. Background work it
+# starts is stopped when that process exits: on 2026-11-04 a reel builder
+# agent launched from the phone was cut ("[Request interrupted by user]")
+# exactly 10 minutes after the turn's reply, and the reel stalled. The
+# phone streams a turn live with no deadline, so long work belongs in the
+# turn itself (ticket 24).
+PHONE_TURN_NOTE = (
+    "This turn was sent from Ken's phone through another_bridge and runs as a "
+    "one-off headless claude -p process. Background work started in this turn "
+    "(the Agent tool or Bash with run_in_background) is stopped about 10 minutes "
+    "after your final reply, when this process exits. Run anything that may take "
+    "longer in the foreground of this turn, without run_in_background, and reply "
+    "when it is finished. The phone shows the turn live and has no time limit."
+)
+
+
+def _phone_flags() -> list[str]:
+    """Flags for every phone-driven turn, new or resumed."""
+    return ["--disallowed-tools", MAC_VOICE_TOOLS, "--append-system-prompt", PHONE_TURN_NOTE]
+
+
 def _resume_flags(session_id: str) -> list[str]:
     """Base flags for every mobile-driven resume."""
-    return ["--resume", session_id, "--disallowed-tools", MAC_VOICE_TOOLS]
+    return ["--resume", session_id] + _phone_flags()
 
 
 def _voice_flags(session_id: str) -> list[str]:
@@ -305,6 +354,7 @@ def _claim(session_id: str, *, force: bool = False) -> str | None:
 
 # What /resume/blocking callers and SSE clients are told for each reason.
 _HOLD_MESSAGES = {
+    "paused": "the queue is paused after Stop",
     "busy": "this session is already processing a message",
     "terminal": "this session is working in a terminal on the Mac",
     "limit": f"{ANOTHER_BRIDGE_MAX_RUNNING_TURNS} phone turns are already running",
@@ -317,6 +367,7 @@ def _end_resume(session_id: str) -> None:
     with _running_guard:
         _running_resumes.pop(session_id, None)
         live_runs.finish(session_id)
+    turn_input.drop(session_id)
 
 
 def _live_run(session_id: str) -> live_runs.LiveRun:
@@ -324,10 +375,13 @@ def _live_run(session_id: str) -> live_runs.LiveRun:
     return live_runs.get(session_id) or live_runs.LiveRun()
 
 
-def _publish_line(run: live_runs.LiveRun, raw: str) -> None:
+def _publish_line(run: live_runs.LiveRun, raw: str, inp: "turn_input.TurnInput | None" = None) -> None:
     """One stream-json line from claude into the turn's live events: text
     deltas as they arrive, then each finished message's tool steps (its
-    text was already streamed by the deltas)."""
+    text was already streamed by the deltas). With the turn's open input
+    (ticket 26): the echo of a message sent mid-turn becomes a ``steer``
+    event with state ``read``, and the ``result`` closes the input so
+    claude exits."""
     line = raw.strip()
     if not line:
         return
@@ -341,6 +395,16 @@ def _publish_line(run: live_runs.LiveRun, raw: str) -> None:
     if chunk:
         run.publish("text", {"chunk": chunk})
         return
+    if inp is not None:
+        if event.get("type") == "result":
+            inp.close()
+            return
+        text = turn_input.replayed_text(event)
+        if text:
+            entry = inp.mark_read(text)
+            if entry is not None:
+                run.publish("steer", {"id": entry["id"], "state": "read"})
+            return
     if event.get("type") == "assistant":
         _, tools = _assistant_blocks(event.get("message", {}).get("content"))
         for t in tools:
@@ -358,23 +422,51 @@ def _follow_sse(run: live_runs.LiveRun, start: int | None = None) -> Iterator[st
             yield _sse(*item)
 
 
+def _image_dict(img) -> dict:
+    if isinstance(img, dict):
+        return {"media_type": img["media_type"], "data": img["data"]}
+    return {"media_type": img.media_type, "data": img.data}
+
+
+@contextmanager
+def _open_turn(session_id: str, args: list[str], cwd: str, job_id: str, message: str, images: list):
+    """Spawn a streamed phone turn with its stdin left open (ticket 26),
+    register that input so the phone can send into the turn or stop it,
+    and write the first message. The input is dropped by _end_resume when
+    claude exits, not when this block ends (a phone that disconnects must
+    still be able to send into the turn after re-attaching)."""
+    with claude_runner.streaming_subprocess_open(args, cwd=cwd, job_id=job_id) as proc:
+        inp = turn_input.TurnInput(getattr(proc, "stdin", None))
+        turn_input.register(session_id, inp)
+        imgs = [_image_dict(i) for i in images]
+        # On a thread: a big image payload can fill the pipe before claude
+        # reads, and the caller must start reading stdout first.
+        threading.Thread(target=inp.send_first, args=(message, imgs), daemon=True).start()
+        yield proc
+
+
 def _spawn_streaming(session_id: str, cwd: str, message: str, images: list, job_id: str):
-    """Start ``claude --resume`` with token streaming. Images can't ride
-    the CLI, so they go as a stream-json user turn on stdin; text-only
-    stays on the -p positional. Returns the subprocess context manager."""
+    """Start ``claude --resume`` with token streaming and an open stream-json
+    input (the message, images included, goes on stdin). Returns the
+    subprocess context manager."""
     model = session_index.latest_model(session_id) or ANOTHER_CODER_RESUME_MODEL
-    flags = ["--verbose", "--include-partial-messages"] + _resume_flags(session_id)
-    if images:
-        args = claude_runner.build_claude_stdin_args(
-            model=model, output_format="stream-json", extra_flags=flags
-        )
-        return claude_runner.streaming_subprocess_stdin(
-            args, cwd=cwd, job_id=job_id, stdin_data=_stdin_message(message, images)
-        )
-    args = claude_runner.build_claude_args(
-        prompt=message, model=model, output_format="stream-json", extra_flags=flags
+    flags = ["--verbose", "--include-partial-messages", "--replay-user-messages"] + _resume_flags(session_id)
+    args = claude_runner.build_claude_stdin_args(model=model, output_format="stream-json", extra_flags=flags)
+    return _open_turn(session_id, args, cwd, job_id, message, images)
+
+
+def _spawn_new_session(session_id: str, cwd: str, message: str, images: list, name: str, job_id: str):
+    """Start a brand-new session with a known id (``--session-id``) and
+    token streaming. Same flags as a phone resume, minus ``--resume``."""
+    flags = [
+        "--verbose", "--include-partial-messages", "--replay-user-messages", "--session-id", session_id,
+    ] + _phone_flags()
+    if name:
+        flags += ["--name", name]
+    args = claude_runner.build_claude_stdin_args(
+        model=ANOTHER_CODER_RESUME_MODEL, output_format="stream-json", extra_flags=flags
     )
-    return claude_runner.streaming_subprocess(args, cwd=cwd, job_id=job_id)
+    return _open_turn(session_id, args, cwd, job_id, message, images)
 
 
 def _resume_started_at(session_id: str) -> float | None:
@@ -409,6 +501,11 @@ def _running_elsewhere(session_id: str) -> list[dict[str, str]]:
 _queues: dict[str, list[dict]] = {}
 _workers: set[str] = set()
 _holds: dict[str, str] = {}
+# Sessions whose queue waits after Stop, until "Run queue" (ticket 26).
+_paused: set[str] = set()
+# Deleted queue items kept for Undo: (session, item id) -> (index, item, time).
+_trash: dict[tuple[str, str], tuple[int, dict, float]] = {}
+TRASH_SECONDS = 600
 _queue_guard = threading.Lock()
 
 # How often a held queue checks the terminal and the cap again.
@@ -445,8 +542,17 @@ def _drain_queue(session_id: str, cwd: str) -> None:
                 _queues.pop(session_id, None)
                 _workers.discard(session_id)
                 _holds.pop(session_id, None)
+                _paused.discard(session_id)
                 return
+            if session_id in _paused:
+                _holds[session_id] = "paused"
+                paused = True
+            else:
+                paused = False
             force = bool(_queues[session_id][0].get("force"))
+        if paused:
+            time.sleep(min(HOLD_POLL_SECONDS, 0.5))
+            continue
 
         # Wait until the session is free: no bridge turn on it, not
         # working in a terminal tab, and a slot under the cap. _claim
@@ -481,8 +587,9 @@ def _drain_queue(session_id: str, cwd: str) -> None:
                 with _spawn_streaming(
                     session_id, cwd, item["message"], item["images"], job.job_id
                 ) as proc:
+                    inp = turn_input.get(session_id)
                     for raw in proc.stdout:
-                        _publish_line(run, raw)
+                        _publish_line(run, raw, inp)
         except Exception as err:  # a bad turn must not kill the worker
             log.error("resume_queue.failed", session_id=session_id, error=str(err))
         finally:
@@ -513,22 +620,42 @@ def _run_queued_voice(session_id: str, cwd: str, item: dict, job_id: str) -> Non
 
 def _enqueue(
     session_id: str, cwd: str, message: str, images: list, preview: str,
-    voice: bool = False, force: bool = False,
-) -> int:
+    voice: bool = False, force: bool = False, text: str | None = None,
+) -> tuple[int, str]:
     """Append a message (+ images) and ensure a drain worker is running.
-    ``message`` already carries the attached-files footer; ``preview`` is
-    what /resume/status shows. Returns the new queue depth."""
+    ``message`` already carries the attached-files footer; ``text`` is what
+    the user typed (for Edit); ``preview`` is what /resume/status shows.
+    Returns (queue depth, the item's id)."""
+    item_id = uuid.uuid4().hex[:12]
     with _queue_guard:
         _queues.setdefault(session_id, []).append(
-            {"message": message, "images": images, "preview": preview, "voice": voice, "force": force}
+            {
+                "id": item_id, "message": message, "text": message if text is None else text,
+                "images": images, "preview": preview, "voice": voice, "force": force,
+            }
         )
         depth = len(_queues[session_id])
-        start_worker = session_id not in _workers
+    _ensure_worker(session_id, cwd)
+    return depth, item_id
+
+
+def _ensure_worker(session_id: str, cwd: str) -> None:
+    with _queue_guard:
+        start_worker = session_id not in _workers and bool(_queues.get(session_id))
         if start_worker:
             _workers.add(session_id)
     if start_worker:
         threading.Thread(target=_drain_queue, args=(session_id, cwd), daemon=True).start()
-    return depth
+
+
+def _queue_items(session_id: str) -> list[dict]:
+    """Queued messages with their ids, for the phone's Send now, Delete and
+    Edit (ticket 26)."""
+    with _queue_guard:
+        return [
+            {"id": it.get("id"), "preview": it["preview"], "text": it.get("text", it["message"])}
+            for it in _queues.get(session_id, ())
+        ]
 
 
 def _extract_reply(stdout: str) -> str:
@@ -728,53 +855,71 @@ def resume_session_stream(request: Request, session_id: str, body: ResumeRequest
             yield _sse("error", {"message": _HOLD_MESSAGES[reason]})
             return
         if reason is not None:
-            yield from _queued_sse(session_id, cwd, message, images, preview, reason, voice=False)
+            yield from _queued_sse(
+                session_id, cwd, message, images, preview, reason, voice=False, text=body.message.strip()
+            )
             return
-        run = _live_run(session_id)
-        spawned = False
-        try:
-            job = job_manager.create(kind="resume_session_stream")
-            log.info("resume_stream.spawning", session_id=session_id, cwd=cwd, job_id=job.job_id)
-            try:
-                with _spawn_streaming(session_id, cwd, message, images, job.job_id) as proc:
-                    # Claude's stdout is read on its own thread into the
-                    # turn's live run, so the turn keeps publishing after
-                    # this client disconnects and a phone can attach again.
-                    def _reader() -> None:
-                        try:
-                            for raw in proc.stdout:
-                                _publish_line(run, raw)
-                        finally:
-                            # Cleared when CLAUDE exits, not when the HTTP
-                            # request ends, so status still says running.
-                            _end_resume(session_id)
-
-                    threading.Thread(target=_reader, daemon=True).start()
-                    spawned = True
-                    # The whole turn from its first event, with keepalives
-                    # during the long silent start of a big session.
-                    yield from _follow_sse(run, start=0)
-            except FileNotFoundError as err:
-                yield _sse("error", {"message": f"could not spawn claude: {err}"})
-                return
-            yield _sse("done", {"session_id": session_id})
-        finally:
-            # On the normal / client-disconnect path the reader's finally
-            # clears the marker when claude exits. Only clear here if the
-            # reader never started (early failure / spawn error).
-            if not spawned:
-                _end_resume(session_id)
+        yield from _run_claimed_turn(
+            session_id,
+            lambda job_id: _spawn_streaming(session_id, cwd, message, images, job_id),
+            kind="resume_session_stream",
+            event="resume_stream.spawning",
+            cwd=cwd,
+        )
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _run_claimed_turn(
+    session_id: str, spawn, *, kind: str, event: str, cwd: str, ready=None
+) -> Iterator[str]:
+    """Run a turn the caller already claimed and stream it as SSE, ending
+    with ``done``. ``spawn(job_id)`` returns the claude subprocess context
+    manager. Claude's stdout is read on its own thread into the turn's live
+    run, so the turn keeps publishing after this client disconnects and a
+    phone can attach again; the in-flight marker clears when CLAUDE exits,
+    not when the HTTP request ends."""
+    run = _live_run(session_id)
+    spawned = False
+    try:
+        job = job_manager.create(kind=kind)
+        log.info(event, session_id=session_id, cwd=cwd, job_id=job.job_id)
+        try:
+            with spawn(job.job_id) as proc:
+                def _reader() -> None:
+                    inp = turn_input.get(session_id)
+                    try:
+                        for raw in proc.stdout:
+                            _publish_line(run, raw, inp)
+                    finally:
+                        _end_resume(session_id)
+
+                threading.Thread(target=_reader, daemon=True).start()
+                spawned = True
+                if ready is not None:
+                    yield from ready()
+                # The whole turn from its first event, with keepalives
+                # during the long silent start of a big session.
+                yield from _follow_sse(run, start=0)
+        except FileNotFoundError as err:
+            yield _sse("error", {"message": f"could not spawn claude: {err}"})
+            return
+        yield _sse("done", {"session_id": session_id})
+    finally:
+        # Only clear here if the reader never started (early failure or
+        # spawn error); otherwise the reader clears it when claude exits.
+        if not spawned:
+            _end_resume(session_id)
+
+
 def _queued_sse(
-    session_id: str, cwd: str, message: str, images: list, preview: str, reason: str, *, voice: bool
+    session_id: str, cwd: str, message: str, images: list, preview: str, reason: str, *, voice: bool,
+    text: str | None = None,
 ) -> Iterator[str]:
     """Queue a held message and tell the phone why, instead of starting a
     second copy of a session that is working in a terminal tab (or going
     past the running-turn cap). The queue runs it once that clears."""
-    depth = _enqueue(session_id, cwd, message, images, preview, voice=voice)
+    depth, _ = _enqueue(session_id, cwd, message, images, preview, voice=voice, text=text)
     log.info("resume_stream.held", session_id=session_id, reason=reason, queued=depth)
     yield _sse("queued", {"reason": reason, "queued": depth, "message": _HOLD_MESSAGES[reason]})
     yield _sse("done", {"session_id": session_id})
@@ -890,10 +1035,11 @@ def enqueue_resume(request: Request, session_id: str, body: ResumeRequest) -> di
     preview = _preview(message, body.images, body.files)
     message = _with_files_footer(message, _save_files(session_id, body.files))
 
-    depth = _enqueue(
-        session_id, cwd, message, body.images, preview, voice=body.voice, force=body.force
+    depth, item_id = _enqueue(
+        session_id, cwd, message, body.images, preview, voice=body.voice, force=body.force,
+        text=body.message.strip(),
     )
-    return {"ok": True, "session_id": session_id, "queued": depth}
+    return {"ok": True, "session_id": session_id, "queued": depth, "id": item_id}
 
 
 @router.post("/sessions/{session_id}/resume/queue/release")
@@ -942,6 +1088,7 @@ def resume_status(request: Request, session_id: str) -> dict[str, Any]:
     poll."""
     started = _resume_started_at(session_id)
     queued = _queued(session_id)
+    inp = turn_input.get(session_id)
     with _queue_guard:
         held = _holds.get(session_id) if queued else None
     state = _terminal(session_id)
@@ -958,7 +1105,377 @@ def resume_status(request: Request, session_id: str) -> dict[str, Any]:
         "held_by": _running_elsewhere(session_id) if held == "limit" else [],
         # Another live copy of the session, usually a terminal tab.
         "terminal": state.as_dict() if state else None,
+        # An "Open on Mac" tap waiting for this session's phone turn to end.
+        "opening_on_mac": _open_pending(session_id),
+        # Ticket 26: queued messages with ids, whether the running turn can
+        # take a message now, the messages sent into it, and Stop's pause.
+        "queue_items": _queue_items(session_id),
+        "can_inject": bool(inp and inp.open),
+        "steers": inp.steers() if inp else [],
+        "paused": session_id in _paused,
     }
+
+
+class QueueEditRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=100_000)
+
+
+def _card_cwd(session_id: str) -> str:
+    card = session_index.get_card(session_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    cwd = card.get("cwd")
+    if not cwd:
+        raise HTTPException(status_code=422, detail="session has no recorded cwd; cannot resume")
+    return cwd
+
+
+def _publish_steer(session_id: str, entry: dict, preview: str) -> None:
+    run = live_runs.get(session_id)
+    if run is not None:
+        run.publish("steer", {"id": entry["id"], "state": entry["state"], "text": preview})
+
+
+def _find_item(session_id: str, item_id: str) -> tuple[int, dict] | None:
+    for i, it in enumerate(_queues.get(session_id, [])):
+        if it.get("id") == item_id:
+            return i, it
+    return None
+
+
+@router.post("/sessions/{session_id}/resume/inject")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def inject_message(request: Request, session_id: str, body: ResumeRequest) -> dict[str, Any]:
+    """Send a message INTO the running phone turn (ticket 26). Claude reads
+    it at its next step, like typing into a busy terminal tab; the live
+    stream then sends ``steer`` with state ``read``. 409 when no running
+    turn can take it (nothing runs, a voice or blocking turn runs, or the
+    turn is ending): the phone queues it instead."""
+    _card_cwd(session_id)
+    message = body.message.strip()
+    if not message and not body.images and not body.files:
+        raise HTTPException(status_code=422, detail="message, images, or files required")
+    inp = turn_input.get(session_id)
+    if inp is None or not inp.open:
+        raise HTTPException(status_code=409, detail="no running turn can take a message now")
+    preview = _preview(message, body.images, body.files)
+    full = _with_files_footer(message, _save_files(session_id, body.files))
+    entry = inp.steer(full, [_image_dict(i) for i in body.images])
+    if entry is None:
+        raise HTTPException(status_code=409, detail="the turn just ended; send it as the next message")
+    _publish_steer(session_id, entry, preview)
+    log.info("resume.injected", session_id=session_id, id=entry["id"])
+    return {"ok": True, "session_id": session_id, "status": "sent_mid_turn", "id": entry["id"]}
+
+
+@router.post("/sessions/{session_id}/resume/stop")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def stop_turn(request: Request, session_id: str) -> dict[str, Any]:
+    """Stop the running phone turn, like Esc in a terminal (ticket 26). If
+    messages are queued, the queue pauses so they can be fixed first;
+    ``/resume/queue/run`` resumes it. 409 when the running turn can't be
+    stopped from the phone (a voice or blocking turn)."""
+    inp = turn_input.get(session_id)
+    if inp is None or not inp.open:
+        if _resume_started_at(session_id) is not None:
+            raise HTTPException(status_code=409, detail="this turn can't be stopped from the phone")
+        return {"ok": True, "session_id": session_id, "stopped": False, "paused": False}
+    stopped = inp.interrupt()
+    with _queue_guard:
+        paused = bool(_queues.get(session_id))
+        if paused and stopped:
+            _paused.add(session_id)
+    log.info("resume.stopped", session_id=session_id, paused=paused)
+    return {"ok": True, "session_id": session_id, "stopped": stopped, "paused": paused and stopped}
+
+
+@router.post("/sessions/{session_id}/resume/queue/run")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def run_queue(request: Request, session_id: str) -> dict[str, Any]:
+    """Resume a queue paused by Stop."""
+    with _queue_guard:
+        _paused.discard(session_id)
+    return {"ok": True, "session_id": session_id}
+
+
+@router.delete("/sessions/{session_id}/resume/queue/{item_id}")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def delete_queued(request: Request, session_id: str, item_id: str) -> dict[str, Any]:
+    """Remove a queued message. It is kept for 10 minutes so
+    ``/restore`` can put it back (the phone's Undo)."""
+    now = time.time()
+    with _queue_guard:
+        found = _find_item(session_id, item_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="that message is not in the queue any more")
+        index, item = found
+        _queues[session_id].pop(index)
+        for key in [k for k, (_, _, t) in _trash.items() if now - t > TRASH_SECONDS]:
+            _trash.pop(key, None)
+        _trash[(session_id, item_id)] = (index, item, now)
+    log.info("resume_queue.deleted", session_id=session_id, id=item_id)
+    return {"ok": True, "session_id": session_id, "removed": item_id, "position": index}
+
+
+@router.post("/sessions/{session_id}/resume/queue/{item_id}/restore")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def restore_queued(request: Request, session_id: str, item_id: str) -> dict[str, Any]:
+    """Undo a delete: the message goes back to where it was."""
+    cwd = _card_cwd(session_id)
+    with _queue_guard:
+        kept = _trash.pop((session_id, item_id), None)
+        if kept is None or time.time() - kept[2] > TRASH_SECONDS:
+            raise HTTPException(status_code=404, detail="that message can't be restored any more")
+        index, item, _ = kept
+        queue = _queues.setdefault(session_id, [])
+        queue.insert(min(index, len(queue)), item)
+    _ensure_worker(session_id, cwd)
+    return {"ok": True, "session_id": session_id, "restored": item_id}
+
+
+@router.patch("/sessions/{session_id}/resume/queue/{item_id}")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def edit_queued(request: Request, session_id: str, item_id: str, body: QueueEditRequest) -> dict[str, Any]:
+    """Change a queued message's text. Its photos and files stay."""
+    text = body.message.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="the message can't be empty")
+    with _queue_guard:
+        found = _find_item(session_id, item_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="that message is not in the queue any more")
+        _, item = found
+        old_text = item.get("text", item["message"])
+        footer = item["message"][len(old_text):] if item["message"].startswith(old_text) else ""
+        item["text"] = text
+        item["message"] = text + footer
+        item["preview"] = text
+    return {"ok": True, "session_id": session_id, "id": item_id}
+
+
+def _send_item_now(session_id: str, item_id: str) -> str:
+    """One queued message, as fast as is safe: into the running turn when
+    it can take it ("sent_mid_turn"); next in line when a turn that can't
+    take messages runs ("next"); else at the front, past the terminal and
+    cap holds and any pause ("starting"). Caller holds no lock."""
+    inp = turn_input.get(session_id)
+    with _queue_guard:
+        found = _find_item(session_id, item_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="that message is not in the queue any more")
+        index, item = found
+        _queues[session_id].pop(index)
+    if inp is not None and inp.open:
+        entry = inp.steer(item["message"], [_image_dict(i) for i in item["images"]], steer_id=item_id)
+        if entry is not None:
+            _publish_steer(session_id, entry, item["preview"])
+            return "sent_mid_turn"
+    item["force"] = True
+    with _queue_guard:
+        _queues.setdefault(session_id, []).insert(0, item)
+        _paused.discard(session_id)
+    return "next" if _resume_started_at(session_id) is not None else "starting"
+
+
+@router.post("/sessions/{session_id}/resume/queue/{item_id}/send-now")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def send_queued_now(request: Request, session_id: str, item_id: str) -> dict[str, Any]:
+    """Send one queued message now (ticket 26). ``status``:
+    ``sent_mid_turn``, ``next`` or ``starting`` (see _send_item_now). For a
+    session working in a Mac tab, "starting" runs a phone copy beside it,
+    so the phone asks first."""
+    cwd = _card_cwd(session_id)
+    status = _send_item_now(session_id, item_id)
+    _ensure_worker(session_id, cwd)
+    log.info("resume_queue.sent_now", session_id=session_id, id=item_id, status=status)
+    return {"ok": True, "session_id": session_id, "id": item_id, "status": status}
+
+
+@router.post("/sessions/{session_id}/resume/queue/send-all-now")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def send_all_queued_now(request: Request, session_id: str) -> dict[str, Any]:
+    """Send now every queued message, in order."""
+    cwd = _card_cwd(session_id)
+    with _queue_guard:
+        ids = [it.get("id") for it in _queues.get(session_id, [])]
+    results = []
+    # Mid-turn sends go in order; anything that must wait keeps its order
+    # by being put back in reverse.
+    statuses: dict[str, str] = {}
+    for item_id in ids:
+        try:
+            statuses[item_id] = _send_item_now(session_id, item_id)
+        except HTTPException:
+            continue
+    with _queue_guard:
+        queue = _queues.get(session_id, [])
+        waiting = [it for it in queue if statuses.get(it.get("id")) in ("next", "starting")]
+        others = [it for it in queue if it not in waiting]
+        waiting.sort(key=lambda it: ids.index(it["id"]) if it.get("id") in ids else 0)
+        if queue:
+            _queues[session_id] = waiting + others
+    for item_id in ids:
+        if item_id in statuses:
+            results.append({"id": item_id, "status": statuses[item_id]})
+    _ensure_worker(session_id, cwd)
+    return {"ok": True, "session_id": session_id, "sent": results}
+
+
+@router.post("/sessions/new/stream")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def new_session_stream(request: Request, body: NewSessionRequest):
+    """Start a new Claude Code session from the phone and stream its first
+    turn (ticket 25). The bridge picks the id, so the first event is
+    ``session`` with it; then the same ``text`` / ``tool`` / ``done`` (or
+    ``error``) events as /resume/stream. Every later message is a normal
+    resume of that id, and the session can be opened on the Mac with
+    /open-on-mac. It runs in ANOTHER_BRIDGE_NEW_SESSION_CWD (the home
+    folder by default). A new session can't be working in a terminal tab,
+    so only the running-turn cap can refuse it (``error`` with reason
+    ``limit``); ``force`` passes the cap."""
+    message = body.message.strip()
+    if not message and not body.images and not body.files:
+        raise HTTPException(status_code=422, detail="message, images, or files required")
+    name = _clean_session_name(body.name)
+    cwd = Path(ANOTHER_BRIDGE_NEW_SESSION_CWD)
+    if not cwd.is_dir():
+        raise HTTPException(status_code=503, detail="the folder for new sessions is missing on the Mac")
+    session_id = str(uuid.uuid4())
+    message = _with_files_footer(message, _save_files(session_id, body.files))
+    images = body.images
+
+    def announce() -> Iterator[str]:
+        # The session event comes once claude has written the transcript,
+        # so the phone can open the chat at once (and attach to this turn)
+        # without a "session not found". Keepalives while it starts.
+        deadline = time.time() + NEW_SESSION_READY_SECONDS
+        last_beat = time.time()
+        while session_index.transcript_path(session_id) is None and time.time() < deadline:
+            time.sleep(NEW_SESSION_POLL_SECONDS)
+            if time.time() - last_beat >= 10:
+                last_beat = time.time()
+                yield ": keepalive\n\n"
+        yield _sse("session", {"session_id": session_id, "cwd": str(cwd), "name": name or None})
+
+    def gen() -> Iterator[str]:
+        reason = _claim(session_id, force=body.force)
+        if reason is not None:
+            yield _sse("error", {"message": _HOLD_MESSAGES[reason], "reason": reason})
+            return
+        yield from _run_claimed_turn(
+            session_id,
+            lambda job_id: _spawn_new_session(session_id, str(cwd), message, images, name, job_id),
+            kind="new_session_stream",
+            event="new_session.spawning",
+            cwd=str(cwd),
+            ready=announce,
+        )
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# How long a new session's first event waits for claude to write the
+# transcript (a big home folder makes claude slow to start), and how often
+# it looks. After the wait the event goes out anyway.
+NEW_SESSION_READY_SECONDS = 30.0
+NEW_SESSION_POLL_SECONDS = 0.1
+
+
+# "Open on Mac" taps waiting for a phone turn to end, by session id.
+_pending_opens: set[str] = set()
+_open_guard = threading.Lock()
+OPEN_POLL_SECONDS = 2.0
+
+
+def _open_pending(session_id: str) -> bool:
+    with _open_guard:
+        return session_id in _pending_opens
+
+
+def _phone_turn_pending(session_id: str) -> bool:
+    """A phone turn is writing the session now, or messages wait to."""
+    return _resume_started_at(session_id) is not None or bool(_queued(session_id))
+
+
+def _open_elsewhere(session_id: str) -> bool:
+    """Another copy holds the session: a terminal tab with a process record,
+    or a ``claude --resume <id>`` still at its startup questions (no record
+    yet). The bridge's own phone turns don't count."""
+    if _terminal(session_id) is not None:
+        return True
+    return bool(mac_terminal.resume_processes(session_id, exclude_parent=os.getpid()))
+
+
+def _open_when_free(session_id: str, command: str, app: str) -> None:
+    """Wait until no phone turn writes the session (or the wait limit),
+    then open the tab, unless a terminal copy appeared meanwhile."""
+    deadline = time.time() + ANOTHER_BRIDGE_OPEN_WAIT_SECONDS
+    try:
+        while _phone_turn_pending(session_id):
+            if time.time() >= deadline:
+                log.warning("open_on_mac.gave_up", session_id=session_id)
+                return
+            time.sleep(OPEN_POLL_SECONDS)
+        if _open_elsewhere(session_id):
+            log.info("open_on_mac.already_open", session_id=session_id)
+            return
+        try:
+            mac_terminal.open_tab(command, app)
+            log.info("open_on_mac.opened", session_id=session_id, app=app, waited=True)
+        except mac_terminal.OpenError as err:
+            log.error("open_on_mac.failed", session_id=session_id, app=app, error=str(err))
+    finally:
+        with _open_guard:
+            _pending_opens.discard(session_id)
+
+
+@router.post("/sessions/{session_id}/open-on-mac")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def open_on_mac(request: Request, session_id: str) -> dict[str, Any]:
+    """Open the session in a new terminal tab on the Mac (ticket 25):
+    iTerm2 when installed, else Terminal, running ``claude --resume <id>``
+    in the session's folder. ``status`` says what happened:
+
+    - ``opened``: the tab is open now.
+    - ``waiting``: a phone turn is writing the session (or messages are
+      queued), so the tab opens when it ends. Two copies never write one
+      transcript. ``/resume/status`` shows ``opening_on_mac`` meanwhile.
+    - ``already_open``: a terminal copy holds it already; nothing opens.
+
+    404 unknown id, 422 no usable folder, 502 osascript failed (for
+    example macOS has not allowed the bridge to control the app yet)."""
+    card = session_index.get_card(session_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    cwd = card.get("cwd") or ""
+    if not cwd or not Path(cwd).is_dir():
+        raise HTTPException(status_code=422, detail="the session's folder no longer exists on the Mac")
+    try:
+        command = mac_terminal.resume_command(
+            session_id, cwd, skip_permissions=ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS
+        )
+        app = mac_terminal.pick_app(
+            ANOTHER_BRIDGE_TERMINAL_APP, iterm_installed=mac_terminal.ITERM_APP_PATH.exists()
+        )
+    except mac_terminal.OpenError as err:
+        raise HTTPException(status_code=422, detail=str(err))
+    if _open_elsewhere(session_id):
+        return {"ok": True, "status": "already_open", "app": app}
+    if _phone_turn_pending(session_id):
+        with _open_guard:
+            start = session_id not in _pending_opens
+            _pending_opens.add(session_id)
+        if start:
+            threading.Thread(target=_open_when_free, args=(session_id, command, app), daemon=True).start()
+        log.info("open_on_mac.waiting", session_id=session_id, app=app)
+        return {"ok": True, "status": "waiting", "app": app}
+    try:
+        mac_terminal.open_tab(command, app)
+    except mac_terminal.OpenError as err:
+        log.error("open_on_mac.failed", session_id=session_id, app=app, error=str(err))
+        raise HTTPException(status_code=502, detail=str(err))
+    log.info("open_on_mac.opened", session_id=session_id, app=app, waited=False)
+    return {"ok": True, "status": "opened", "app": app}
 
 
 @router.get("/sessions/{session_id}")

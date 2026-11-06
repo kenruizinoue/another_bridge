@@ -111,6 +111,20 @@ class Settings(BaseSettings):
     # <claude-config>/sessions, next to the projects folder.
     another_bridge_claude_sessions_dir: str = ""
 
+    # ── New sessions and Open on Mac (ticket 25) ───────────────────
+    # Folder a session started from the phone runs in. Empty means the
+    # home folder, where Ken starts his terminal sessions. Must exist.
+    another_bridge_new_session_cwd: str = ""
+    # Which app "Open on Mac" uses: auto (iTerm2 when installed, else
+    # Terminal), iterm or terminal.
+    another_bridge_terminal_app: str = "auto"
+    # The opened tab runs `claude --dangerously-skip-permissions --resume`,
+    # matching how Ken starts his terminal sessions. False drops the flag.
+    another_bridge_open_skip_permissions: bool = True
+    # How long an "Open on Mac" tap waits for a running phone turn on that
+    # session to finish before giving up. A reel build takes about 30 min.
+    another_bridge_open_wait_seconds: int = Field(default=3 * 60 * 60, ge=10)
+
     # ── Persistence ────────────────────────────────────────────────
     # Empty → resolved to ~/.another_coder/sessions.db at consumer
     # time. Tests override to ``:memory:`` via tests/conftest.py
@@ -247,6 +261,14 @@ CLAUDE_PROJECTS_DIR: Path = _resolve_claude_projects_dir()
 ANOTHER_BRIDGE_TERMINAL_ACTIVE_SECONDS: int = settings.another_bridge_terminal_active_seconds
 ANOTHER_BRIDGE_TERMINAL_LINE_SECONDS: int = settings.another_bridge_terminal_line_seconds
 ANOTHER_BRIDGE_MAX_RUNNING_TURNS: int = settings.another_bridge_max_running_turns
+ANOTHER_BRIDGE_NEW_SESSION_CWD: Path = (
+    Path(settings.another_bridge_new_session_cwd).expanduser()
+    if settings.another_bridge_new_session_cwd
+    else Path.home()
+)
+ANOTHER_BRIDGE_TERMINAL_APP: str = settings.another_bridge_terminal_app.strip().lower()
+ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS: bool = settings.another_bridge_open_skip_permissions
+ANOTHER_BRIDGE_OPEN_WAIT_SECONDS: int = settings.another_bridge_open_wait_seconds
 ANOTHER_BRIDGE_CLAUDE_SESSIONS_DIR: Path = (
     Path(settings.another_bridge_claude_sessions_dir).expanduser()
     if settings.another_bridge_claude_sessions_dir.strip()
