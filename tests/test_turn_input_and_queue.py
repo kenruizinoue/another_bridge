@@ -252,3 +252,106 @@ class TestQueuedMessages:
 
     def test_send_now_on_a_missing_message_is_a_404(self, client) -> None:  # noqa: F811
         assert client.post("/sessions/sess-1/resume/queue/nope/send-now").status_code == 404
+
+
+# ── A finished turn kept alive by something in the background (ticket 27) ─
+
+
+class TestLingering:
+    def test_lingering_only_after_the_reply_and_quiet(self) -> None:
+        inp = TurnInput(fake_turns.FakeStdin())
+        inp.saw_line(False, now=100.0)
+        assert not inp.lingering(60, now=1000.0)  # no result yet: still working
+        inp.saw_line(True, now=200.0)
+        assert not inp.lingering(60, now=230.0)
+        assert inp.lingering(60, now=261.0)
+        inp.saw_line(False, now=262.0)  # a background notice started a new turn
+        assert not inp.lingering(60, now=900.0)
+
+    def _alive_procs(self, monkeypatch, procs: list, cancelled: list) -> None:
+        class AliveProc(fake_turns.ControlledProc):
+            def __init__(self) -> None:
+                super().__init__()
+                self.killed = False
+
+            def poll(self):
+                return 0 if self.killed else None
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def fake_open(args, cwd, job_id):
+            proc = AliveProc()
+            procs.append(proc)
+            yield proc
+
+        def fake_cancel(job_id):
+            cancelled.append(job_id)
+            procs[-1].killed = True
+            procs[-1].end()
+            return True
+
+        monkeypatch.setattr(sessions_router.claude_runner, "streaming_subprocess_open", fake_open)
+        monkeypatch.setattr(sessions_router.job_manager, "cancel", fake_cancel)
+
+    def test_a_process_left_alive_after_its_reply_is_ended(self, client, monkeypatch) -> None:  # noqa: F811
+        procs: list = []
+        cancelled: list = []
+        self._alive_procs(monkeypatch, procs, cancelled)
+        monkeypatch.setattr(sessions_router, "ANOTHER_BRIDGE_LINGER_SECONDS", 0.2)
+        monkeypatch.setattr(sessions_router, "LINGER_POLL_SECONDS", 0.02)
+        client.post("/sessions/sess-1/resume/queue", json={"message": "run the preview"})
+        client.post("/sessions/sess-1/resume/queue", json={"message": "next one"})
+        assert _wait(lambda: procs and procs[0].stdin.lines)
+        procs[0].emit(RESULT)  # replied, but a dev server keeps it alive
+        assert _wait(lambda: cancelled, timeout=3)
+        assert _wait(lambda: len(procs) == 2)  # the queue moved on
+        assert procs[1].stdin.texts() == ["next one"]
+        procs[1].killed = True
+        procs[1].end()
+
+    def test_a_working_turn_is_never_ended(self, client, monkeypatch) -> None:  # noqa: F811
+        procs: list = []
+        cancelled: list = []
+        self._alive_procs(monkeypatch, procs, cancelled)
+        monkeypatch.setattr(sessions_router, "ANOTHER_BRIDGE_LINGER_SECONDS", 0.2)
+        monkeypatch.setattr(sessions_router, "LINGER_POLL_SECONDS", 0.02)
+        client.post("/sessions/sess-1/resume/queue", json={"message": "long build"})
+        assert _wait(lambda: procs and procs[0].stdin.lines)
+        time.sleep(0.5)  # quiet, but no result yet
+        assert cancelled == []
+        procs[0].killed = True
+        procs[0].end()
+
+    def test_stop_ends_a_process_whose_reply_is_done(self, client, monkeypatch) -> None:  # noqa: F811
+        procs: list = []
+        cancelled: list = []
+        self._alive_procs(monkeypatch, procs, cancelled)
+        client.post("/sessions/sess-1/resume/queue", json={"message": "run the preview"})
+        assert _wait(lambda: procs and procs[0].stdin.lines)
+        procs[0].emit(RESULT)
+        assert _wait(lambda: procs[0].stdin.closed)
+        r = client.post("/sessions/sess-1/resume/stop").json()
+        assert r["stopped"] is True and len(cancelled) == 1
+        assert _wait(lambda: not _status(client)["running"])
+
+    def test_the_phone_note_warns_about_servers(self) -> None:
+        assert "shopify theme dev" in sessions_router.PHONE_TURN_NOTE
+        assert "localhost" in sessions_router.PHONE_TURN_NOTE
+
+
+def test_descendant_groups_finds_background_shells_in_their_own_groups() -> None:
+    from services.claude_runner import descendant_groups
+
+    ps = """
+     1     0     1
+  4698     1  4698
+ 10297  4698 10297
+ 10305 10297 10297
+ 11000  4698  4698
+ 12000 11000 12000
+ 99999     1 99999
+garbage
+"""
+    assert sorted(descendant_groups(4698, ps)) == [10297, 12000]
+    assert descendant_groups(99999, ps) == []

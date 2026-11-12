@@ -18,6 +18,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -31,6 +32,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import (
+    ANOTHER_BRIDGE_LINGER_SECONDS,
+    ANOTHER_BRIDGE_TRASH_DIR,
     ANOTHER_BRIDGE_MAX_RUNNING_TURNS,
     ANOTHER_BRIDGE_NEW_SESSION_CWD,
     ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS,
@@ -42,7 +45,7 @@ from config import (
     ANOTHER_CODER_RESUME_TIMEOUT_SECONDS,
 )
 from jobs import job_manager
-from services import claude_runner, live_runs, mac_terminal, terminal_activity, turn_input
+from services import claude_runner, live_runs, mac_terminal, process_view, resume_listing, terminal_activity, turn_input
 from services.rate_limiter import limiter
 from services.session_index import _assistant_blocks, session_index
 
@@ -193,7 +196,13 @@ PHONE_TURN_NOTE = (
     "(the Agent tool or Bash with run_in_background) is stopped about 10 minutes "
     "after your final reply, when this process exits. Run anything that may take "
     "longer in the foreground of this turn, without run_in_background, and reply "
-    "when it is finished. The phone shows the turn live and has no time limit."
+    "when it is finished. The phone shows the turn live and has no time limit. "
+    "Don't leave servers or watchers running when you reply (shopify theme dev, "
+    "npm run dev, a preview server): Ken is on his phone and can't open "
+    "localhost, and the bridge ends this process about 2 minutes after your "
+    "reply if anything keeps it alive. For a preview, give a link that works "
+    "from the phone instead (for a Shopify theme, an unpublished theme's preview "
+    "URL)."
 )
 
 
@@ -368,6 +377,28 @@ def _end_resume(session_id: str) -> None:
         _running_resumes.pop(session_id, None)
         live_runs.finish(session_id)
     turn_input.drop(session_id)
+    with _jobs_guard:
+        _turn_jobs.pop(session_id, None)
+    _show_in_resume(session_id)
+
+
+def _show_in_resume(session_id: str) -> None:
+    """Ticket 33: Claude Code's /resume hides a session whose first turn
+    ran headless, which is every session started from the phone. After a
+    phone turn ends, and only while nothing else holds the session, mark
+    it as started in a terminal so /resume lists it. A session started in
+    a terminal is left alone at once (its first value is already ``cli``).
+    When something holds it, the next phone turn's end tries again."""
+    try:
+        path = session_index.transcript_path(session_id)
+        if path is None or resume_listing.first_entrypoint(path) != "sdk-cli":
+            return
+        if _phone_turn_pending(session_id) or _open_elsewhere(session_id):
+            return
+        result = resume_listing.show_in_resume(path)
+        log.info("resume_listing.marked", session_id=session_id, result=result)
+    except Exception as err:  # never break the end of a turn
+        log.warning("resume_listing.failed", session_id=session_id, error=str(err))
 
 
 def _live_run(session_id: str) -> live_runs.LiveRun:
@@ -396,6 +427,7 @@ def _publish_line(run: live_runs.LiveRun, raw: str, inp: "turn_input.TurnInput |
         run.publish("text", {"chunk": chunk})
         return
     if inp is not None:
+        inp.saw_line(event.get("type") == "result")
         if event.get("type") == "result":
             inp.close()
             return
@@ -438,11 +470,41 @@ def _open_turn(session_id: str, args: list[str], cwd: str, job_id: str, message:
     with claude_runner.streaming_subprocess_open(args, cwd=cwd, job_id=job_id) as proc:
         inp = turn_input.TurnInput(getattr(proc, "stdin", None))
         turn_input.register(session_id, inp)
+        with _jobs_guard:
+            _turn_jobs[session_id] = job_id
+        threading.Thread(target=_end_if_lingering, args=(session_id, inp, proc, job_id), daemon=True).start()
         imgs = [_image_dict(i) for i in images]
         # On a thread: a big image payload can fill the pipe before claude
         # reads, and the caller must start reading stdout first.
         threading.Thread(target=inp.send_first, args=(message, imgs), daemon=True).start()
         yield proc
+
+
+# The job of each session's running streamed turn, so Stop can end a
+# process whose input is already closed, and the linger check can end one
+# that only stays alive for something left in the background.
+_turn_jobs: dict[str, str] = {}
+_jobs_guard = threading.Lock()
+LINGER_POLL_SECONDS = 5.0
+
+
+def _end_if_lingering(session_id: str, inp: "turn_input.TurnInput", proc, job_id: str) -> None:
+    """Watch one turn's process: once its reply is done and it printed
+    nothing for ANOTHER_BRIDGE_LINGER_SECONDS, end it (SIGTERM to its
+    process group, then SIGKILL), so the session and its queue move on.
+    The reply is already in the transcript."""
+    poll = getattr(proc, "poll", None)
+    if poll is None:
+        return  # a test double without a real process
+    while poll() is None:
+        if inp.lingering(ANOTHER_BRIDGE_LINGER_SECONDS):
+            pid = getattr(proc, "pid", None)
+            left = claude_runner.descendant_groups(pid) if isinstance(pid, int) else []
+            log.warning("resume.lingering_ended", session_id=session_id, job_id=job_id, background_groups=left)
+            job_manager.cancel(job_id)
+            claude_runner.end_groups(left)  # what it left in the background
+            return
+        time.sleep(LINGER_POLL_SECONDS)
 
 
 def _spawn_streaming(session_id: str, cwd: str, message: str, images: list, job_id: str):
@@ -1175,10 +1237,26 @@ def stop_turn(request: Request, session_id: str) -> dict[str, Any]:
     messages are queued, the queue pauses so they can be fixed first;
     ``/resume/queue/run`` resumes it. 409 when the running turn can't be
     stopped from the phone (a voice or blocking turn)."""
+    return _stop_phone_turn(session_id)
+
+
+def _stop_phone_turn(session_id: str) -> dict[str, Any]:
     inp = turn_input.get(session_id)
     if inp is None or not inp.open:
         if _resume_started_at(session_id) is not None:
-            raise HTTPException(status_code=409, detail="this turn can't be stopped from the phone")
+            # The reply is done but the process lives on (something left in
+            # the background), or a turn without an open input: end it.
+            with _jobs_guard:
+                job_id = _turn_jobs.get(session_id)
+            if job_id is None:
+                raise HTTPException(status_code=409, detail="this turn can't be stopped from the phone")
+            job_manager.cancel(job_id)
+            with _queue_guard:
+                paused = bool(_queues.get(session_id))
+                if paused:
+                    _paused.add(session_id)
+            log.info("resume.stopped_process", session_id=session_id, job_id=job_id, paused=paused)
+            return {"ok": True, "session_id": session_id, "stopped": True, "paused": paused}
         return {"ok": True, "session_id": session_id, "stopped": False, "paused": False}
     stopped = inp.interrupt()
     with _queue_guard:
@@ -1187,6 +1265,72 @@ def stop_turn(request: Request, session_id: str) -> dict[str, Any]:
             _paused.add(session_id)
     log.info("resume.stopped", session_id=session_id, paused=paused)
     return {"ok": True, "session_id": session_id, "stopped": stopped, "paused": paused and stopped}
+
+
+class StopSessionRequest(BaseModel):
+    confirm: str = Field(min_length=1, max_length=64)
+    # Also end every Bash command the session's Claude runs (background
+    # servers too), not just the turn.
+    commands: bool = False
+
+
+@router.post("/sessions/{session_id}/stop")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def stop_session(request: Request, session_id: str, body: StopSessionRequest) -> dict[str, Any]:
+    """Stop what a session is doing, wherever it runs (ticket 30):
+
+    - a phone turn: interrupted like /resume/stop (the queue pauses);
+    - a Mac tab that is working: the bridge presses Esc in its iTerm2 tab,
+      found by the process's terminal device, the key that stops Claude
+      at the keyboard. An idle tab gets nothing (Esc could clear what Ken
+      is typing there).
+    - ``commands``: also every Bash command its Claude runs, background
+      ones too.
+
+    ``turn`` says what was stopped: ``phone``, ``mac_tab``, ``none``, or
+    ``unsupported`` (a working tab that isn't in iTerm2). 422 when
+    ``confirm`` isn't the id, 404 for an unknown session."""
+    if body.confirm != session_id:
+        raise HTTPException(status_code=422, detail="confirm must be the session id")
+    if session_index.get_card(session_id) is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    records = process_view.read_records(terminal_activity.watch.sessions_dir)
+    rows = process_view.read_ps()
+    mine = [r for r in records if r.get("sessionId") == session_id and r.get("pid") in rows]
+    turn = "none"
+    paused = False
+    if _resume_started_at(session_id) is not None:
+        result = _stop_phone_turn(session_id)
+        turn = "phone" if result.get("stopped") else "none"
+        paused = bool(result.get("paused"))
+    else:
+        for rec in mine:
+            pid = rec["pid"]
+            if rows[pid].ppid == os.getpid() or rec.get("entrypoint") != "cli" or rec.get("status") != "busy":
+                continue
+            tty = mac_terminal.tty_of(pid)
+            try:
+                sent = bool(tty) and mac_terminal.press_escape(tty)
+            except mac_terminal.OpenError as err:
+                raise HTTPException(status_code=502, detail=str(err))
+            turn = "mac_tab" if sent else (turn if turn == "mac_tab" else "unsupported")
+    stopped_commands = 0
+    if body.commands:
+        entries = process_view.snapshot(mine, rows, os.getpid())
+        for entry in entries:
+            for cmd in entry["commands"]:
+                proc = rows.get(cmd["pid"])
+                if proc is not None and proc.pgid == proc.pid:
+                    process_view.end_group(proc.pgid)
+                    stopped_commands += 1
+    log.warning("session.stopped", session_id=session_id, turn=turn, commands=stopped_commands)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "turn": turn,
+        "paused": paused,
+        "commands_stopped": stopped_commands,
+    }
 
 
 @router.post("/sessions/{session_id}/resume/queue/run")
@@ -1476,6 +1620,48 @@ def open_on_mac(request: Request, session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(err))
     log.info("open_on_mac.opened", session_id=session_id, app=app, waited=False)
     return {"ok": True, "status": "opened", "app": app}
+
+
+class DeleteSessionRequest(BaseModel):
+    """The id again, typed by the client: a second check, so a stray or
+    replayed request can't delete a conversation."""
+
+    confirm: str = Field(min_length=1, max_length=64)
+
+
+@router.delete("/sessions/{session_id}")
+@limiter.limit(ANOTHER_CODER_RATE_LIMIT_SESSIONS)
+def delete_session(request: Request, session_id: str, body: DeleteSessionRequest) -> dict[str, Any]:
+    """Delete a conversation from the phone (ticket 28). Its transcript
+    and its folder (subagents, tool output) and its phone attachments are
+    MOVED to ANOTHER_BRIDGE_TRASH_DIR/<time>_<id>/, not erased, so moving
+    them back undoes it.
+
+    422 when ``confirm`` isn't the id. 409 while a phone turn runs or
+    messages wait, or while a Mac tab holds the session (that process
+    would keep writing the file). 404 unknown id."""
+    if body.confirm != session_id:
+        raise HTTPException(status_code=422, detail="confirm must be the session id")
+    path = session_index.transcript_path(session_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+    if _resume_started_at(session_id) is not None or _queued(session_id):
+        raise HTTPException(status_code=409, detail="a phone turn is running or messages are queued; stop it first")
+    if _open_elsewhere(session_id):
+        raise HTTPException(status_code=409, detail="this session is open in a Mac tab; close it there first")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = ANOTHER_BRIDGE_TRASH_DIR / f"{stamp}_{re.sub(r'[^A-Za-z0-9_-]', '_', session_id)}"
+    dest.mkdir(parents=True, exist_ok=False)
+    moved = []
+    folder = path.with_suffix("")  # <id>/ beside <id>.jsonl
+    attachments = ANOTHER_CODER_ATTACHMENTS_DIR / re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+    for src, name in ((path, path.name), (folder, "session_folder"), (attachments, "attachments")):
+        if src.exists():
+            shutil.move(str(src), str(dest / name))
+            moved.append(name)
+    (dest / "origin.txt").write_text(f"{path}\n", encoding="utf-8")
+    log.warning("session.deleted", session_id=session_id, trash=str(dest), moved=moved)
+    return {"ok": True, "session_id": session_id, "trash": str(dest), "moved": moved}
 
 
 @router.get("/sessions/{session_id}")

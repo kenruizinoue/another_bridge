@@ -66,6 +66,10 @@ class TurnInput:
         self._lock = threading.Lock()
         self._open = stdin is not None
         self._steers: list[dict] = []
+        # For the linger check: when claude last printed a line, and when
+        # its last `result` came (None while a reply is being written).
+        self._last_line = time.time()
+        self._result_at: float | None = None
 
     @property
     def open(self) -> bool:
@@ -125,6 +129,23 @@ class TurnInput:
                     self._stdin.close()
                 except (OSError, ValueError, AttributeError):
                     pass
+
+    def saw_line(self, is_result: bool, now: float | None = None) -> None:
+        """Claude printed a line. A ``result`` marks the reply done; any
+        other line (a background task's notice started a new turn) means
+        it is working again."""
+        stamp = time.time() if now is None else now
+        with self._lock:
+            self._last_line = stamp
+            self._result_at = stamp if is_result else None
+
+    def lingering(self, seconds: float, now: float | None = None) -> bool:
+        """The reply is done and claude printed nothing for ``seconds``:
+        the process only stays alive for something left in the background
+        (a dev server, a watcher), and the session would wait on it."""
+        stamp = time.time() if now is None else now
+        with self._lock:
+            return self._result_at is not None and stamp - self._last_line >= seconds
 
     def steers(self) -> list[dict]:
         with self._lock:

@@ -19,7 +19,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from auth import validate_keys, verify_any_key, verify_api_key, verify_phone_key
 from config import ANOTHER_BRIDGE_FILE_ROOTS, ANOTHER_BRIDGE_NEW_SESSION_CWD, ANOTHER_BRIDGE_TERMINAL_APP, CLAUDE_MODEL
-from routers import auth as auth_router, chat, files, github, health, implementation, jobs, planning, repos, sessions, tts
+from routers import auth as auth_router, chat, files, github, health, implementation, jobs, planning, processes, repos, sessions, tts
 from services import mac_terminal
 from services.file_roots import FileBrowser, parse_roots
 from services.guard import GuardMiddleware
@@ -123,6 +123,7 @@ app.include_router(repos.router, dependencies=_authed)
 # Session browsing — GET /sessions[/{id}] serves the mobile card list
 # from the on-disk Claude Code transcript tree (read-only; no resume).
 app.include_router(sessions.router, dependencies=_phone)
+app.include_router(processes.router, dependencies=_phone)
 # Speech synthesis proxy — POST /tts forwards to the local Kokoro
 # OpenAI-compatible endpoint for the mobile voice conversation mode.
 app.include_router(tts.router, dependencies=_phone)

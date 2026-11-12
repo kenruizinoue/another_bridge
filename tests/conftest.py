@@ -154,6 +154,26 @@ def _no_real_claude_turns(monkeypatch):
     from services import claude_runner
 
     def refuse(*_a, **_k):
+        # On 2026-11-05, before this guard, five new-session tests whose
+        # fakes still patched the old runner started real Opus sessions in
+        # pytest folders (they showed on the phone as "hi" and "hello").
         raise AssertionError("a test started a real claude turn; install tests/fake_turns.py")
 
     monkeypatch.setattr(claude_runner, "streaming_subprocess_open", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _attachments_in_tmp(tmp_path, monkeypatch):
+    """Files a test attaches never land in the real ~/.another_coder
+    attachments folder (a ticket 26 test wrote seven there, 2026-11-05)."""
+    from routers import sessions as sessions_router
+
+    monkeypatch.setattr(sessions_router, "ANOTHER_CODER_ATTACHMENTS_DIR", tmp_path / "attachments")
+
+
+@pytest.fixture(autouse=True)
+def _trash_in_tmp(tmp_path, monkeypatch):
+    """A deleted session in a test goes to a tmp trash, never the real one."""
+    from routers import sessions as sessions_router
+
+    monkeypatch.setattr(sessions_router, "ANOTHER_BRIDGE_TRASH_DIR", tmp_path / "trash")

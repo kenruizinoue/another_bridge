@@ -1,4 +1,18 @@
-# another_bridge: security and quality pass (v0.4.0)
+# another_bridge: project plan
+
+## Next up (order agreed with Ken, 2026-11-08)
+
+1. Ticket 31: Tailscale, ngrok off (with app ticket 33). Starts when Ken
+   has Tailscale installed and signed in on the Mac and the iPhone.
+2. Keys out of the app: app ticket 3 (Connect screen, key in the Keychain)
+   and app ticket 4 with ticket 14 here (OpenAI through the bridge).
+3. Face ID lock: app ticket 28.
+4. The rest of the security pass: tickets 1, 4 to 13, 15 to 18.
+5. Later: the AnotherTask link ideas (`docs/ANOTHERTASK_LINK_IDEA.txt`)
+   and the items under "Optional, not scheduled".
+
+The sections below started as the v0.4.0 security and quality pass
+(2026-10-23) and grew with every phase since.
 
 ## Goal
 
@@ -20,6 +34,7 @@ can turn into a command line option. After this pass:
 ## Decisions (confirmed by Ken, 2026-10-23)
 
 1. Keep ngrok for now. Tailscale is an optional ticket for later.
+   (Replaced by decision 13 on 2026-11-07.)
 2. The phone's key is entered once in the app and stored in the iPhone
    Keychain (client side, see the mobile plan), then the key is rotated.
 3. Separate keys for the phone and for AnotherAgent.
@@ -47,6 +62,17 @@ can turn into a command line option. After this pass:
     most 3 phone turns run at once (2 at first, raised the same day). "Send anyway" skips both. A hook
     catches terminal tabs up on phone turns, and every session only
     messages its own agents (playbook rule).
+
+13. Tailscale instead of ngrok (Ken, 2026-11-07, "create the ticket"):
+    only Ken's own devices can reach the bridge (ticket 31).
+14. Always on (Ken, 2026-11-07, "do the launchd approach"): the server and
+    ngrok are launchd services that start at login, turned off with
+    `scripts/bridge_service.py off` (ticket 32). No desktop app for now
+    (2026-11-08): the private web chat can carry a status page later.
+15. Security order (Ken, 2026-11-08): Tailscale first, then the keys out
+    of the app, then the Face ID lock (see "Next up").
+16. Sessions started from the phone show in Claude Code's /resume like the
+    others (Ken, 2026-11-11, ticket 33).
 
 ## Contract with the phone app (another_bridge_mobile 1.4.0)
 
@@ -151,6 +177,13 @@ can turn into a command line option. After this pass:
 | 24 | Phone turns run long work in the foreground | Done (2026-11-05) |
 | 25 | New session from the phone, Open on Mac | Done (2026-11-05) |
 | 26 | Talk to a running turn, queue actions | Done (2026-11-05) |
+| 27 | End a finished turn kept alive in the background | Done (2026-11-05) |
+| 28 | Delete a session from the phone | Done (2026-11-05) |
+| 29 | What runs on the Mac, and stop a command | Done (2026-11-05) |
+| 30 | Stop a session wherever it runs | Done (2026-11-05) |
+| 31 | Private network with Tailscale, ngrok off | Todo |
+| 32 | Start at login with launchd | Done (2026-11-07) |
+| 33 | Phone-made sessions in /resume | Done (2026-11-11) |
 
 ## Phase 1: stop the cheap attacks
 
@@ -841,11 +874,264 @@ Acceptance criteria:
 
 - 535 tests pass.
 
+### Ticket 27 - End a finished turn kept alive in the background
+
+Objective:
+
+- A session never waits on a phone turn that already replied. On
+  2026-11-05 a Kodama turn replied at 18:06 and left `shopify theme dev`
+  running in the background. Its `claude -p` stayed alive, so the bridge
+  counted it as running and the 2 queued messages waited 40 minutes,
+  with no Stop that worked.
+
+TDD work:
+
+- `TurnInput.saw_line` and `lingering`: lingering only after a `result`
+  and no output since; a later line (a background notice starting a new
+  turn) resets it.
+- A watcher per streamed turn ends the process group after
+  `ANOTHER_BRIDGE_LINGER_SECONDS` of that; a quiet turn still writing
+  its reply is never ended; the queue moves on.
+- Stop ends a process whose input is already closed.
+- `PHONE_TURN_NOTE` says not to leave servers or watchers running.
+
+Acceptance criteria:
+
+- 540 tests pass.
+
+### Ticket 28 - Delete a session from the phone
+
+Objective:
+
+- Ken deletes a conversation from the phone, with checks fit for a
+  critical action.
+
+TDD work (`tests/test_delete_session.py`):
+
+- The body must repeat the id (422 otherwise, also with no body).
+- Busy (a phone turn running or messages queued) and open in a Mac tab
+  are refused with 409; unknown is 404.
+- Nothing is erased: the transcript, its folder and the phone
+  attachments move to a trash folder with an `origin.txt`.
+
+Acceptance criteria:
+
+- 546 tests pass. App 1.10.0 asks twice (a warning, then typing DELETE).
+
+### Ticket 29 - What runs on the Mac, and stop a command
+
+Objective:
+
+- Ken sees from the phone every Bash command Claude runs on the Mac, in
+  Mac tabs and phone turns, and can stop one (the stuck `shopify theme
+  dev` of 2026-11-05 is the case).
+
+TDD work (`tests/test_processes.py`, `services/process_view.py`):
+
+- `ps` parsing, running times, the command out of the Bash tool's
+  wrapper (with and without `< /dev/null`, heredoc newlines shown as
+  `\012`), secrets redacted (keys, Bearer tokens, key headers, KEY=...).
+- The snapshot: origin phone (a child of the bridge), Mac tab (`cli`) or
+  headless; only Bash commands, not helpers; dead records skipped.
+- Stop only a Bash command of a live Claude process, never a Claude
+  process, the bridge or anything else; the pid twice.
+
+Acceptance criteria:
+
+- 567 tests pass.
+
+### Ticket 30 - Stop a session wherever it runs
+
+Objective:
+
+- One Stop per session from the phone, whether Claude works in a phone
+  turn or in a Mac terminal tab, optionally with every command it runs.
+
+TDD work (`tests/test_stop_session.py`):
+
+- A working Mac tab gets Esc (`mac_terminal.press_escape` on the tty of
+  its Claude process); an idle tab gets nothing; a tab outside iTerm2 is
+  `unsupported`; a phone turn goes through the /resume/stop path;
+  `commands` ends each Bash command's group; the id twice; 404; 502 when
+  osascript fails.
+- `tty_of`, and the AppleScript only takes a `/dev/ttysN` and only sends
+  Esc.
+
+Edge cases:
+
+- Checked 2026-11-05 on a throwaway iTerm2 tab running `cat -v`: the Esc
+  found by tty reached that tab only.
+
+Acceptance criteria:
+
+- 584 tests pass.
+
+## Phase 6: private network, always on
+
+### Ticket 31 - Private network with Tailscale, ngrok off
+
+Status: Todo (created 2026-11-07).
+
+Objective:
+
+- Only Ken's own devices can reach the bridge. Today the fixed ngrok URL
+  is public and the phone key is the only gate. The key also sits in
+  plain text inside the app's JS bundle (checked 2026-11-07), so a copy
+  of the app works as a shell on the Mac.
+- Tailscale (a private WireGuard network for Ken's devices) joins the Mac
+  and the iPhone. `tailscale serve` publishes the bridge at
+  `https://<mac>.<tailnet>.ts.net` on the tailnet only, with a real
+  certificate. uvicorn stays on 127.0.0.1:8000. ngrok stops.
+
+Setup (Ken, needs his logins):
+
+- Install Tailscale on the Mac and on the iPhone, signed in to the same
+  account.
+- In the Tailscale admin console, turn on MagicDNS and HTTPS
+  certificates.
+- On the iPhone, turn on VPN On Demand so it reconnects by itself. iOS
+  runs one VPN at a time.
+
+Bridge work:
+
+- `tailscale serve --bg 8000` (the config survives restarts). Never
+  `tailscale funnel`, which makes the bridge public again.
+- Guard: requests now arrive from 127.0.0.1 through serve. Confirm what
+  serve puts in `X-Forwarded-For` so the lockout counts per device, not
+  one shared localhost bucket; adjust `client_address` if needed.
+- Second gate: require the `Tailscale-User-Login` header serve adds to
+  equal `ANOTHER_BRIDGE_TAILSCALE_LOGIN`, 401 when missing or different,
+  off when the variable is unset. First verify serve sets this header
+  itself and drops a client-sent copy.
+- Stop ngrok and take it out of the start steps; keep it in the README
+  only as a documented fallback.
+- Docs: SECURITY.md trust boundary (tailnet instead of a public URL),
+  README start steps, CURL_EXAMPLES.md.
+
+TDD work (`tests/test_guard.py`):
+
+- `client_address` from serve's forwarded header.
+- Login gate: match, mismatch, missing header, variable unset.
+
+App side (another_bridge_mobile ticket 33):
+
+- `EXPO_PUBLIC_BRIDGE_URL` becomes the ts.net address, rebuilt with a new
+  version.
+
+Edge cases:
+
+- Tailscale off on the phone: the app shows offline, nothing reaches the
+  Mac.
+- Mac restart: the Tailscale app starts at login and serve keeps its
+  config, but the bridge still needs starting by hand (the 2026-11-07
+  restart left it down).
+- AnotherAgent surface: since 2026-10-24 the log holds a single
+  AnotherAgent request (a 401 from an unknown address), so nothing else
+  needs ngrok. If the platform needs the bridge again, that is its own
+  ticket (a cloud server cannot join the tailnet as simply).
+- Confirm the current Tailscale free plan limits at setup.
+
+Acceptance criteria:
+
+- On cellular with Tailscale on: list, chat, Files and On the Mac work.
+- With Tailscale off, and from any other device: no response.
+- The old ngrok URL answers as offline.
+- All tests pass.
+
+### Ticket 32 - Start at login with launchd
+
+Status: Done (2026-11-07).
+
+Objective:
+
+- After a Mac restart the phone works as soon as Ken logs in, with
+  nothing started by hand. On 2026-11-07 a restart left the bridge and
+  ngrok down until they were started again from a terminal.
+- `scripts/bridge_service.py` installs the server and ngrok as launchd
+  services (`com.kenruizinoue.another-bridge.server` and `.ngrok` in
+  `~/Library/LaunchAgents`): they start at login and launchd starts
+  either again when it stops. `on`, `off`, `restart`, `status`, each for
+  both or only `server` or `ngrok` (`off ngrok` for ticket 31).
+
+TDD work (`tests/test_bridge_service.py`, a fake launchctl/lsof/ps/kill):
+
+- The server plist runs uvicorn on 127.0.0.1 through Ken's login shell
+  (`zsh -lic`), so phone turns get the terminal's PATH (`claude` is under
+  nvm). The ngrok plist uses `ANOTHER_BRIDGE_NGROK_URL` from `.env`,
+  https only.
+- `on` stops a bridge or an ngrok for the same URL started by hand,
+  leaves any other program on port 8000 alone, reloads an installed
+  service, and reports a failed bootstrap.
+- `on`, `off` and `restart` refuse while a phone turn runs on the bridge
+  (stopping the server cuts its reply) unless `--force`.
+
+Edge cases:
+
+- Checked 2026-11-07 on the real Mac: switched from the hand-started
+  bridge, `/health`, `/sessions` and `/processes` answer through ngrok,
+  the server's PATH has nvm, a killed server was back in 2 s, and
+  osascript to iTerm2 from the launchd Python ran with no permission
+  prompt (Open on Mac).
+- `~/.another_coder/restart_after_turn.sh` lets launchd start the new
+  bridge when the service is loaded, instead of starting a second one.
+
+Acceptance criteria:
+
+- 612 tests pass. Verified live as above.
+
+## Phase 7: sessions on the Mac
+
+### Ticket 33 - Phone-made sessions in /resume
+
+Status: Done (2026-11-11).
+
+Objective:
+
+- A session started from the phone shows in Claude Code's /resume picker
+  like a session started in a terminal. Ken created "2026/Nov/11
+  AnotherStorage" from the phone and could not find it in /resume.
+- Cause, read in Claude Code 2.1.319: /resume skips a session when the
+  first `"entrypoint":"` value in the first 64 KB of its transcript is
+  `sdk-cli`, `sdk-ts` or `sdk-py`. Every phone turn runs `claude -p`
+  (`sdk-cli`), so only sessions whose first turn came from the phone were
+  hidden.
+- Fix (`services/resume_listing.py`): when a phone turn ends and nothing
+  else holds the session (no queued message, no Mac tab), the bridge
+  changes that first value to `cli` in place, padded with spaces after
+  the closing quote, so the line keeps its length and stays valid JSON.
+  Only the first value changes; later phone turns keep `sdk-cli`, which
+  the terminal catch-up hook and the busy check rely on.
+
+TDD work (`tests/test_resume_listing.py`):
+
+- A port of Claude's check sees `cli` after the mark; same file size,
+  every line still parses, later values untouched; a terminal session and
+  a second run change nothing; no value in the first 64 KB is left alone;
+  lines appended around the mark survive.
+- The end of a phone turn marks the session; it waits while a message is
+  queued or a Mac tab holds it; a terminal session never scans for
+  holders; a missing transcript or a failure never breaks a turn's end.
+
+Edge cases:
+
+- An older phone-made session is marked after its next phone turn.
+  AnotherStorage was marked by hand on 2026-11-11 (822 lines, all parse).
+- If a Claude Code update changes the check, the sessions are only hidden
+  again; nothing breaks. Recheck the rule when /resume misses one.
+
+Acceptance criteria:
+
+- 623 tests pass. AnotherStorage passes the ported check.
+
 ## Optional, not scheduled
 
-- Tailscale: serve the bridge only on the private network, with an access
-  rule for the iPhone.
-- An ngrok traffic policy as a second gate.
+- AnotherTask link (idea, 2026-11-08): AnotherTask MCP server, AI time
+  from hooks, private web chat. See `docs/ANOTHERTASK_LINK_IDEA.txt`.
+- Answer Claude Code's "trust this folder" question in tabs that Open on
+  Mac opens (2026-11-08): read the screen first, only that tab, only in
+  iTerm2. Waiting on Ken's go.
+- A menu bar icon (a SwiftBar plugin) with status, On, Off and Restart
+  calling `scripts/bridge_service.py` (2026-11-08).
 - A lock file for exact dependency versions.
 - E2E tests, only after Ken approves.
 

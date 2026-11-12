@@ -159,3 +159,58 @@ def validate_config(terminal_app: str, new_session_cwd: Path) -> None:
         )
     if not new_session_cwd.is_dir():
         raise OpenError(f"ANOTHER_BRIDGE_NEW_SESSION_CWD={str(new_session_cwd)!r} is not a folder")
+
+
+# Ticket 30: stop a session working in a Mac tab by pressing Esc in it,
+# the same key that stops Claude at the keyboard. The tab is found by its
+# terminal device (iTerm2 knows each session's tty). Tested 2026-11-05 on
+# a throwaway tab: the Esc reached that tab only.
+_TTY = re.compile(r"^/dev/ttys\d{1,4}$")
+
+
+def tty_of(pid: int, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str | None:
+    """The terminal device of a process, like /dev/ttys004, or None."""
+    try:
+        out = run(["ps", "-o", "tty=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    name = (out or "").strip()
+    tty = f"/dev/{name}" if name and not name.startswith("/") else name
+    return tty if _TTY.match(tty or "") else None
+
+
+def iterm_escape_script(tty: str) -> str:
+    """Press Esc in the iTerm2 session on ``tty``; prints sent or missing."""
+    if not _TTY.match(tty):
+        raise OpenError(f"not a terminal device: {tty!r}")
+    return "\n".join(
+        [
+            'tell application "iTerm"',
+            "    repeat with aWindow in windows",
+            "        repeat with aTab in tabs of aWindow",
+            "            repeat with aSession in sessions of aTab",
+            f'                if tty of aSession is "{tty}" then',
+            "                    tell aSession to write text (character id 27) newline no",
+            '                    return "sent"',
+            "                end if",
+            "            end repeat",
+            "        end repeat",
+            "    end repeat",
+            '    return "missing"',
+            "end tell",
+        ]
+    )
+
+
+def press_escape(tty: str, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> bool:
+    """True when an iTerm2 session on ``tty`` got the Esc, False when no
+    iTerm2 session has that tty (a Terminal window, say). OpenError when
+    osascript fails."""
+    script = iterm_escape_script(tty)
+    try:
+        result = run(["osascript", "-e", script], capture_output=True, text=True, timeout=OSASCRIPT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise OpenError(f"osascript failed: {err}") from err
+    if result.returncode != 0:
+        raise OpenError(f"osascript exited {result.returncode}: {(result.stderr or '').strip()[:300]}")
+    return (result.stdout or "").strip() == "sent"

@@ -8,6 +8,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Sessions started from the phone show in Claude Code's /resume. When a
+  phone turn ends and nothing else holds the session, the bridge marks its
+  first turn as a terminal one (one value, changed in place). Ticket 33.
+
+- `scripts/bridge_service.py` runs the server and ngrok as launchd
+  services that start at login and restart when they stop (`on`, `off`,
+  `restart`, `status`, for both or one). The server starts through the
+  login shell so phone turns keep the terminal's PATH. It refuses while
+  a phone turn runs unless `--force`. `ANOTHER_BRIDGE_NGROK_URL` in
+  `.env` holds the tunnel's URL. Ticket 32.
+
+- `POST /sessions/{id}/stop` with `{"confirm": "<id>", "commands"}`
+  stops what a session is doing wherever it runs: a phone turn is
+  interrupted (the queue pauses); a Mac tab that is working gets Esc in
+  its iTerm2 tab, found by the process's terminal device (an idle tab
+  gets nothing, so a half-typed message there is safe); `commands` also
+  ends every Bash command its Claude runs. `turn` is `phone`, `mac_tab`,
+  `none` or `unsupported` (a working window outside iTerm2). Ticket 30.
+
+- `GET /processes` lists every live Claude Code process (Mac tabs and
+  phone turns, from Claude's `sessions/<pid>.json` records) with the Bash
+  commands running under it: command (taken out of the Bash tool's zsh
+  wrapper, keys and passwords redacted), running time, CPU and process
+  count. `POST /processes/{pid}/stop` with `{"confirm": pid}` ends one of
+  those commands' process groups (SIGTERM, then SIGKILL after 3 s); any
+  other pid is 404. Ticket 29.
+
+- `DELETE /sessions/{id}` with `{"confirm": "<id>"}` deletes a session
+  from the phone. Its transcript, folder and phone attachments move to
+  `ANOTHER_BRIDGE_TRASH_DIR/<time>_<id>/` (default
+  `~/.another_coder/trash/sessions`) with an `origin.txt`, so moving them
+  back undoes it. 422 when `confirm` isn't the id, 409 while a phone turn
+  runs or messages wait, or while a Mac tab holds it. Ticket 28.
+
 - Talk to a running phone turn (ticket 26). Every streamed phone turn
   runs with an open stream-json stdin and `--replay-user-messages`.
   `POST /sessions/{id}/resume/inject` writes a message into the running
@@ -87,6 +121,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
   AnotherAgent routes. `/auth/verify` takes either key.
 
 ### Fixed
+
+- `/processes` and `/processes/{pid}/stop` answered 401 to the phone key:
+  the guard sent the new path to the AnotherAgent surface. `processes` is
+  now a phone segment, with surface tests (2026-11-07).
+
+- Tests can't write to the real attachments folder or trash any more
+  (one wrote seven files to `~/.another_coder/attachments` on
+  2026-11-05), and the comment on the real-claude guard records the five
+  Opus sessions the new-session tests started before it existed.
+
+- A phone turn whose reply is done but whose process stays alive with no
+  output for `ANOTHER_BRIDGE_LINGER_SECONDS` (120 s) is ended, and Stop
+  ends such a process too. On 2026-11-05 a Kodama turn replied at 18:06
+  and left `shopify theme dev` running in the background; the process
+  never exited, so the session and its 2 queued messages waited 40
+  minutes. The phone note now also says not to leave servers running.
+  Ticket 27.
 
 - Session cards show the time of the last real message, and the list
   sorts by it. The file's mtime said "41 min ago" on a session idle for

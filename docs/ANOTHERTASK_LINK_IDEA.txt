@@ -1,0 +1,135 @@
+ANOTHERTASK + BRIDGE: ONE PLACE TO ORGANIZE, TRACK AND CHAT WITH CLAUDE
+Idea and tickets, written 2026-11-08. Nothing here is built yet.
+Status tags: [IDEA] [TODO] [WIP] [DONE].
+Size: S = under half a day, M = about a day, L = 2 to 3 days.
+
+
+THE IDEA
+------------------------------------------------------------------------
+Today the work is split: tasks, steps and time live in AnotherTask, and the
+Claude work happens in Mac terminal tabs or the iPhone bridge app. The goal
+is one experience:
+
+- AnotherTask organizes and tracks: each Claude session belongs to a task,
+  its steps are the task's actions, and the time Claude works is logged as
+  AI time on that task by itself.
+- Claude updates AnotherTask on its own through an AnotherTask MCP server
+  (MCP = Model Context Protocol, the standard way to give Claude tools):
+  read tasks, add steps, check steps, add notes. This works from any
+  session, terminal tab or phone.
+- Chat from any browser through a private web chat served by the bridge,
+  reachable only on Ken's Tailscale network. It can be added to the iPhone
+  home screen like an app, so no more 7 day signing expiry.
+
+
+SAFETY RULES (apply to every ticket)
+------------------------------------------------------------------------
+- Nothing that can drive the Mac goes into the public AnotherTask site.
+  AnotherTask has other users; one injected script there must never reach
+  the Mac. The site only links to the private chat.
+- Everything that talks to the Mac is reachable only on the Tailscale
+  network (bridge ticket 31 comes first).
+- The MCP server signs in as Ken's own AnotherTask account, so the
+  Firestore rules keep it inside his data. No Firebase admin key on the
+  Mac (it could reach every user's data in prod).
+- No delete tools at first. A wrong call can add or check, never remove.
+- Time is recorded by code (Claude Code hooks), not by Claude. Claude
+  decides what happened; the code measures how long.
+- Only metadata leaves the Mac for Firestore (session title, state,
+  times). Never message text, files or transcripts.
+- Dev Firebase first, prod only after the QA ticket passes.
+
+
+PHASE A: PRIVATE NETWORK (prerequisite)
+------------------------------------------------------------------------
+ATB-0  Tailscale, ngrok off                              [TODO]
+- Bridge ticket 31 and app ticket 33. Everything below assumes it.
+
+
+PHASE B: ANOTHERTASK MCP SERVER (local, on the Mac)
+------------------------------------------------------------------------
+ATB-1  Decisions                                         [IDEA]  S
+- Where it lives: proposed a new small repo (anothertask_mcp, Node) that
+  follows the same data contract as anothertask_web (action order and ids
+  like createAction, time records with trackerKind "ai"), so AnotherTask's
+  rules are not reinvented in Python.
+- How it signs in: Ken's AnotherTask email login, secret kept in the macOS
+  Keychain, never in a repo or a .env.
+- Where the session to task link is stored (see ATB-4).
+
+ATB-2  Read tools                                        [IDEA]  M
+- List projects. List tasks (by project, status, search). Get one task
+  with its actions and time totals (human and AI).
+
+ATB-3  Write tools                                       [IDEA]  M
+- Create a task. Add an action (step). Check or uncheck an action. Add a
+  note to a task's description.
+- No delete, no edits to time records, no invoices.
+
+ATB-4  Link a session to a task                          [IDEA]  M
+- A tool "this session works on task X". One task per session.
+- Storage idea: users/{uid}/claude_sessions/{sessionId} holding only the
+  task id, title and times. The current rules already cover new
+  subcollections under users/{uid}.
+
+ATB-5  AI time from hooks                                [IDEA]  M
+- A Claude Code hook starts an AI time record on the linked task when a
+  turn starts and stops it when the turn ends. Works for terminal tabs and
+  phone turns (verify that phone turns run the same hooks).
+- Safety net: a record left open by a crash is closed at the next start,
+  with a maximum length.
+
+ATB-6  Hook it into Claude Code, dev first               [IDEA]  S
+- Register the MCP server in Ken's Claude Code settings against the dev
+  Firebase project. Switch to prod after ATB-7.
+
+ATB-7  QA                                                [IDEA]  M
+- One real session end to end on dev: link, add steps, check them, time
+  appears as AI time on the task in the web app.
+- Proof it cannot delete, and cannot read another user's data (rules test).
+
+
+PHASE C: ANOTHERTASK SHOWS THE SESSIONS
+------------------------------------------------------------------------
+ATB-8  Session status on the task page                   [IDEA]  M
+- The task page shows its linked session: working or idle, last message
+  time, and an "Open chat" button that opens the private web chat
+  (ATB-9). Data comes from the claude_sessions docs (metadata only).
+- Web first, then Android and iOS follow the same contract.
+
+
+PHASE D: PRIVATE WEB CHAT (served by the bridge)
+------------------------------------------------------------------------
+ATB-9  Web chat at the Tailscale address                 [IDEA]  L
+- The bridge serves its own web page, same address as the API: no CORS,
+  no third-party scripts, a strict content security policy.
+- First version: session list, chat, queue, Stop, Files. Voice later.
+
+ATB-10 Sign in with the AnotherTask account              [IDEA]  M
+- The web chat signs in with Ken's AnotherTask (Firebase) login and the
+  bridge checks that token belongs to Ken's account. No fixed key stored
+  in the browser.
+- The iPhone app keeps its phone key until it is retired (ATB-12).
+
+ATB-11 Add to Home Screen                                [IDEA]  S
+- Web app manifest and icon so it opens full screen from the iPhone home
+  screen like an app.
+
+ATB-12 Keep or retire the iOS app                        [IDEA]  S
+- Decide after a few weeks of daily use of the web chat.
+
+
+LATER (product idea, not for now)
+------------------------------------------------------------------------
+- A hosted AnotherTask MCP with proper login for every AnotherTask user
+  ("connect your tasks to Claude"), possibly a Pro feature.
+
+
+OPEN QUESTIONS
+------------------------------------------------------------------------
+- New repo for the MCP server, or a folder inside anothertask_web?
+- Do phone turns (claude -p) run the same hooks as terminal tabs?
+- Can a human timer and the AI timer run on the same task at once, and
+  how do stats and invoices treat AI time?
+- Are session titles fine to store in Firestore, or keep only the task id
+  and times?

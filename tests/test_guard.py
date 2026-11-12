@@ -75,6 +75,8 @@ def client() -> TestClient:
         ("/tts", "phone"),
         ("/transcribe", "phone"),
         ("/files/raw", "phone"),
+        ("/processes", "phone"),
+        ("/processes/123/stop", "phone"),
         ("/auth/verify", "any"),
         ("/chat/stream", "agent"),
         ("/tools/instruct_planning", "agent"),

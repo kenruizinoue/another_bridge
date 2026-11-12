@@ -116,6 +116,27 @@ ngrok http 8000
 
 Copy the HTTPS URL (e.g. `https://abc-123.ngrok-free.dev`).
 
+### Keep it running (macOS)
+
+Run the server and ngrok as launchd services: macOS starts both when you
+log in and starts either again if it stops. Put your fixed ngrok URL in
+`.env` as `ANOTHER_BRIDGE_NGROK_URL`, then:
+
+```bash
+python3 -I scripts/bridge_service.py on              # install and start both
+python3 -I scripts/bridge_service.py status          # running? pid, health, url
+python3 -I scripts/bridge_service.py restart server  # load new code
+python3 -I scripts/bridge_service.py off             # stop both, no start at login
+python3 -I scripts/bridge_service.py off ngrok       # only the tunnel
+```
+
+`on` replaces a server or ngrok you started by hand. `on`, `off` and
+`restart` wait for a running phone turn (stopping the server cuts its
+reply); add `--force` to go ahead anyway. Logs go to
+`~/.another_coder/bridge.log` and `~/.another_coder/ngrok.log`. After a
+Mac restart you still have to log in once; nothing of yours runs before
+that.
+
 ### 5. Wire the platform
 
 In the AnotherAgent dashboard:

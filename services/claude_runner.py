@@ -364,3 +364,48 @@ def streaming_subprocess_open(
         yield proc
     finally:
         job_manager.detach_process(job_id)
+
+
+def descendant_groups(pid: int, ps_output: str | None = None) -> list[int]:
+    """Process groups of every descendant of ``pid`` other than its own.
+    Claude Code runs a background Bash command in its own group, so ending
+    a turn's group alone leaves, say, a `shopify theme dev` it started
+    running (2026-11-05). ``ps_output`` is for tests."""
+    if ps_output is None:
+        try:
+            ps_output = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,pgid="], capture_output=True, text=True, timeout=5
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+    children: dict[int, list[int]] = {}
+    pgid_of: dict[int, int] = {}
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            continue
+        p, pp, g = (int(x) for x in parts)
+        children.setdefault(pp, []).append(p)
+        pgid_of[p] = g
+    own = pgid_of.get(pid, pid)
+    groups: list[int] = []
+    stack = list(children.get(pid, []))
+    while stack:
+        p = stack.pop()
+        g = pgid_of.get(p)
+        if g is not None and g != own and g not in groups:
+            groups.append(g)
+        stack.extend(children.get(p, []))
+    return groups
+
+
+def end_groups(groups: list[int]) -> None:
+    """SIGTERM each process group; missing ones are skipped."""
+    import os
+    import signal
+
+    for g in groups:
+        try:
+            os.killpg(g, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass

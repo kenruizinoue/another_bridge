@@ -31,7 +31,7 @@ ANY = "any"
 
 # First path segment to surface. Everything else, including /docs and
 # unknown paths, is the AnotherAgent surface.
-_PHONE_SEGMENTS = frozenset({"sessions", "tts", "transcribe", "files"})
+_PHONE_SEGMENTS = frozenset({"sessions", "tts", "transcribe", "files", "processes"})
 
 LARGE_BODY_BYTES = 40 * 1024 * 1024
 SMALL_BODY_BYTES = 64 * 1024

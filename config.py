@@ -124,6 +124,16 @@ class Settings(BaseSettings):
     # How long an "Open on Mac" tap waits for a running phone turn on that
     # session to finish before giving up. A reel build takes about 30 min.
     another_bridge_open_wait_seconds: int = Field(default=3 * 60 * 60, ge=10)
+    # A phone turn whose reply is done (its `result` came) but whose claude
+    # process stays alive with no new output this long is ended. On
+    # 2026-11-05 a Kodama turn replied at 18:06 and left `shopify theme
+    # dev` running in the background; the process never exited, so the
+    # session and its 2 queued messages waited for 40 minutes (ticket 27).
+    another_bridge_linger_seconds: int = Field(default=120, ge=5)
+    # Where a session deleted from the phone goes (ticket 28): it is moved
+    # here, not erased, so a mistake can be undone by moving it back.
+    # Empty means ~/.another_coder/trash/sessions.
+    another_bridge_trash_dir: str = ""
 
     # ── Persistence ────────────────────────────────────────────────
     # Empty → resolved to ~/.another_coder/sessions.db at consumer
@@ -269,6 +279,12 @@ ANOTHER_BRIDGE_NEW_SESSION_CWD: Path = (
 ANOTHER_BRIDGE_TERMINAL_APP: str = settings.another_bridge_terminal_app.strip().lower()
 ANOTHER_BRIDGE_OPEN_SKIP_PERMISSIONS: bool = settings.another_bridge_open_skip_permissions
 ANOTHER_BRIDGE_OPEN_WAIT_SECONDS: int = settings.another_bridge_open_wait_seconds
+ANOTHER_BRIDGE_LINGER_SECONDS: int = settings.another_bridge_linger_seconds
+ANOTHER_BRIDGE_TRASH_DIR: Path = (
+    Path(settings.another_bridge_trash_dir).expanduser()
+    if settings.another_bridge_trash_dir
+    else Path.home() / ".another_coder" / "trash" / "sessions"
+)
 ANOTHER_BRIDGE_CLAUDE_SESSIONS_DIR: Path = (
     Path(settings.another_bridge_claude_sessions_dir).expanduser()
     if settings.another_bridge_claude_sessions_dir.strip()
